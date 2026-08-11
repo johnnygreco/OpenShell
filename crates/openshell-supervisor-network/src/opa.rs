@@ -1128,7 +1128,7 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
             // so downstream validation can fail closed on malformed input
             // rather than silently dropping it.
             if let Some(ports) = ep_obj.get_mut("ports").and_then(|v| v.as_array_mut()) {
-                ports.retain(|p| !p.as_u64().is_some_and(|n| n == 0));
+                ports.retain(|p| p.as_u64().is_none_or(|n| n != 0));
             }
 
             let has_ports = ep_obj
