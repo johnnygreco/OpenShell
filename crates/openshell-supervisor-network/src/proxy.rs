@@ -6390,6 +6390,7 @@ mod tests {
                             as i32,
                         max_payload_bytes: 1024,
                         timeout: "1s".into(),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                 },
@@ -6416,6 +6417,16 @@ mod tests {
             _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only test service"))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: tonic::Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::AgentConversationResult>,
             tonic::Status,
         > {
             Err(tonic::Status::unimplemented("WebSocket-only test service"))
@@ -6474,6 +6485,7 @@ mod tests {
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }

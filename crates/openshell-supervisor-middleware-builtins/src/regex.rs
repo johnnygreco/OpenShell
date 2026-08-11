@@ -56,12 +56,14 @@ pub fn describe() -> Vec<MiddlewareBinding> {
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             timeout: String::new(),
+            ..Default::default()
         },
         MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: SupervisorMiddlewarePhase::PreCredentials as i32,
             max_payload_bytes: MAX_PAYLOAD_BYTES,
             timeout: String::new(),
+            ..Default::default()
         },
     ]
 }

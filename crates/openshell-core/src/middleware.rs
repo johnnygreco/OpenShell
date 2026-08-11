@@ -11,8 +11,9 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, MiddlewareManifest,
-    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    AgentConversationEvaluation, AgentConversationResult, HttpHeader, HttpRequestEvaluation,
+    HttpRequestResult, HttpRequestTarget, MiddlewareManifest, RequestContext,
+    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
@@ -42,6 +43,11 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         &self,
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status>;
+
+    async fn evaluate_agent_conversation(
+        &self,
+        request: Request<AgentConversationEvaluation>,
+    ) -> Result<Response<AgentConversationResult>, Status>;
 
     async fn open_websocket_session(
         &self,
@@ -176,6 +182,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
 ///                 timeout: String::new(),
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///         }

@@ -26,6 +26,7 @@ openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
 tokio = { workspace = true }
+axum = { workspace = true }
 
 # gRPC (tonic::Status downcast in error mapping)
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
@@ -47,6 +48,7 @@ rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost = { workspace = true }
+uuid = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

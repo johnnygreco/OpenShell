@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Supervisor Middleware"
 sidebar-title: "Supervisor Middleware"
-description: "Configure and operate built-in and operator-run middleware for sandbox HTTP requests and WebSocket messages."
+description: "Configure and operate built-in and operator-run middleware for sandbox HTTP, WebSocket, and agent requests."
 keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering"
 ---
 
 Supervisor middleware adds ordered processing stages to allowed HTTP and WebSocket egress. Middleware runs after network and L7 policy admit traffic and before OpenShell injects provider credentials. A stage can allow or deny an HTTP request or client WebSocket text message, replace its payload, add approved HTTP headers, and report audit-safe findings.
+
+Operator middleware can also advertise versioned agent-harness bindings. For managed Pi, the sandbox supervisor exposes a loopback bridge only when one configured middleware advertises `rendered_prompt_admission` for `openshell.pi-input.v1`. The supervisor sets `OPENSHELL_PI_CONVERSATION_URL`; the sandbox deployment loads the middleware's Pi extension through Pi's standard extension mechanism. Pi itself remains unaware of OpenShell. The MVP admits a rendered, idle, text-only user prompt before Pi stores it; denied prompts never enter chat history, while replacement bodies support redaction. The supervisor stamps sandbox and provider identity before dispatch. Agent admission is fail closed and does not use the HTTP or WebSocket middleware chains. Admission bodies are limited to 32 KiB. Images, queued input, retries, compaction, and automatic continuations after tool calls are intentionally unsupported until a separate model-request boundary is added.
 
 Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
 
@@ -52,7 +54,7 @@ The request context identifies the originating sandbox to operator-run services.
 
 `openshell/regex` is an example built-in middleware. It replaces only simple, self-contained token patterns in UTF-8 HTTP bodies and client WebSocket text messages; the initial pattern recognizes `sk-` tokens. It does not infer values from keyword assignments such as JSON `password` fields. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
 
-Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase. V1 supports `HttpRequest/pre_credentials` and `WebSocketMessage/pre_credentials`; a service may expose either or both. Policies attach the complete middleware by its operator-owned gateway registration name.
+Operator-run services expose bindings for supported operation and phase pairs. HTTP and WebSocket bindings use `HttpRequest/pre_credentials` and `WebSocketMessage/pre_credentials`. Agent bindings use `AgentConversation/agent_context` plus a harness, hook, and schema version. Policies attach the complete middleware by its operator-owned gateway registration name.
 
 ## Register a Middleware Service
 
@@ -223,7 +225,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 ## Current Limitations
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
-- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
+- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and `AGENT_CONVERSATION/AGENT_CONTEXT`.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
 - Selection uses destination host include and exclude patterns.

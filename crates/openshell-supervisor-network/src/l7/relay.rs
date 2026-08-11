@@ -3510,6 +3510,7 @@ network_policies:
                         max_payload_bytes:
                             openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
                         timeout: "2s".into(),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                 },
@@ -3536,6 +3537,16 @@ network_policies:
             _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only middleware"))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: tonic::Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::AgentConversationResult>,
             tonic::Status,
         > {
             Err(tonic::Status::unimplemented("WebSocket-only middleware"))
@@ -5320,6 +5331,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }
@@ -5467,6 +5479,7 @@ network_policies:
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }
@@ -5938,6 +5951,7 @@ network_policies:
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }

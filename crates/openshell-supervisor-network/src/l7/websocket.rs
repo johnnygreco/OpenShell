@@ -3524,6 +3524,7 @@ network_policies:
                     max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                         as u64,
                     timeout: "1s".into(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }))
@@ -3546,6 +3547,14 @@ network_policies:
             &self,
             _request: Request<openshell_core::proto::HttpRequestEvaluation>,
         ) -> std::result::Result<Response<openshell_core::proto::HttpRequestResult>, Status>
+        {
+            Err(Status::unimplemented("WebSocket-only test middleware"))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<Response<openshell_core::proto::AgentConversationResult>, Status>
         {
             Err(Status::unimplemented("WebSocket-only test middleware"))
         }

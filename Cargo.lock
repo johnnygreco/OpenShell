@@ -4248,6 +4248,7 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "clap",
  "futures",
  "miette",

@@ -7,8 +7,8 @@ use openshell_core::middleware::{
 };
 use openshell_core::proto::middleware::v1::supervisor_middleware_client::SupervisorMiddlewareClient;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketSessionEvent,
+    AgentConversationEvaluation, AgentConversationResult, HttpRequestEvaluation, HttpRequestResult,
+    MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse, WebSocketSessionEvent,
 };
 use openshell_extension_core::{
     BearerTokenInterceptor, BearerTokenSlot, ExtensionChannelConfig, ExtensionServerTrust,
@@ -94,6 +94,16 @@ impl GrpcMiddlewareService {
             .await
     }
 
+    /// Forward an owned agent evaluation through the protobuf service contract.
+    pub async fn evaluate_agent_conversation(
+        &self,
+        request: AgentConversationEvaluation,
+    ) -> std::result::Result<Response<AgentConversationResult>, Status> {
+        self.service
+            .evaluate_agent_conversation(Request::new(request))
+            .await
+    }
+
     /// Open a remote WebSocket middleware stream through the gRPC adapter.
     pub async fn open_websocket_session(
         &self,
@@ -164,6 +174,14 @@ impl SupervisorMiddlewareEndpoint for RemoteMiddlewareService {
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
         client.evaluate_http_request(request).await
+    }
+
+    async fn evaluate_agent_conversation(
+        &self,
+        request: Request<AgentConversationEvaluation>,
+    ) -> std::result::Result<Response<AgentConversationResult>, Status> {
+        let mut client = self.client.clone();
+        client.evaluate_agent_conversation(request).await
     }
 
     async fn open_websocket_session(

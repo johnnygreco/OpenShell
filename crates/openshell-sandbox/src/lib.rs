@@ -6,6 +6,7 @@
 //! This crate provides process sandboxing and monitoring capabilities.
 
 mod activity_aggregator;
+mod agent_bridge;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
@@ -60,7 +61,9 @@ pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::proposals::AgentProposals;
+use openshell_core::proto::NetworkMiddlewareConfig;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_supervisor_middleware::ChainRunner;
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
@@ -84,6 +87,46 @@ fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) ->
 }
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
+const PI_AGENT_HOOKS: &[&str] = &["rendered_prompt_admission"];
+
+struct PiBridgeSelection {
+    middleware_name: String,
+    provider_host: String,
+    middleware_config: prost_types::Struct,
+}
+
+async fn select_pi_bridge(
+    runner: &ChainRunner,
+    configs: &std::collections::HashMap<String, NetworkMiddlewareConfig>,
+) -> Result<Option<PiBridgeSelection>> {
+    let supported = runner
+        .agent_conversation_middleware_names("pi", "openshell.pi-input.v1", PI_AGENT_HOOKS)
+        .await?;
+    let mut matches = configs
+        .iter()
+        .filter(|(_, config)| supported.contains(&config.middleware));
+    let Some((config_name, config)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(miette::miette!(
+            "managed Pi admission requires exactly one matching middleware config"
+        ));
+    }
+    let endpoints = config.endpoints.as_ref().ok_or_else(|| {
+        miette::miette!("Pi admission middleware config '{config_name}' requires endpoints")
+    })?;
+    if endpoints.include.len() != 1 || endpoints.include[0].contains('*') {
+        return Err(miette::miette!(
+            "Pi admission middleware config '{config_name}' requires one exact provider host"
+        ));
+    }
+    Ok(Some(PiBridgeSelection {
+        middleware_name: config.middleware.clone(),
+        provider_host: endpoints.include[0].clone(),
+        middleware_config: config.config.clone().unwrap_or_default(),
+    }))
+}
 
 /// Run a command in the sandbox.
 ///
@@ -548,6 +591,50 @@ pub async fn run_sandbox(
     } else {
         None
     };
+
+    let pi_bridge = match (opa_engine.as_ref(), retained_proto.as_ref()) {
+        (Some(engine), Some(proto)) => {
+            let runner = engine.middleware_runner()?;
+            select_pi_bridge(&runner, &proto.network_middlewares)
+                .await?
+                .map(|selection| (selection, runner))
+        }
+        _ => None,
+    };
+    if let Some((selection, runner)) = pi_bridge {
+        if sidecar_network_enforcement {
+            return Err(miette::miette!(
+                "managed Pi admission is not supported in sidecar topology"
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let listener = netns
+            .as_ref()
+            .ok_or_else(|| miette::miette!("Pi admission bridge requires network enforcement"))?
+            .bind_tcp_in_netns(agent_bridge::BRIDGE_ADDR)
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind Pi admission bridge")?;
+        #[cfg(not(target_os = "linux"))]
+        let listener = tokio::net::TcpListener::bind(agent_bridge::BRIDGE_ADDR)
+            .await
+            .into_diagnostic()?;
+        agent_bridge::spawn(
+            listener,
+            runner,
+            agent_bridge::BridgeConfig {
+                middleware_name: selection.middleware_name,
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                provider_host: selection.provider_host,
+                middleware_config: selection.middleware_config,
+            },
+        );
+        provider_env.insert(
+            agent_bridge::BRIDGE_URL_ENV.into(),
+            agent_bridge::BRIDGE_URL.into(),
+        );
+        info!(url = agent_bridge::BRIDGE_URL, "Pi admission bridge ready");
+    }
 
     #[cfg(target_os = "linux")]
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {

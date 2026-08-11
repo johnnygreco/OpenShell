@@ -181,6 +181,8 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+Managed agent admission reuses the operator middleware registry without joining the HTTP chain. When a configured operator service advertises the required Pi rendered-prompt hook, the sandbox supervisor binds a loopback-only bridge inside the workload network namespace. The bridge stamps sandbox and provider identity, forwards the bounded versioned request to the selected gRPC service, and returns only its structured decision, optional replacement, and opaque receipt.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
