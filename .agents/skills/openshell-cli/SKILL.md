@@ -427,11 +427,19 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP, WebSocket, and agent-conversation bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
+
+An operator service can also advertise `AGENT_CONVERSATION/AGENT_CONTEXT`.
+Agent admission requires `fail_closed`, exactly one configured agent binding,
+and one exact provider host that resolves to one admitted network endpoint. The
+supervisor exposes `OPENSHELL_AGENT_CONVERSATION_URL` in combined topology and
+keeps `OPENSHELL_PI_CONVERSATION_URL` as a compatibility alias. Adding the first
+agent binding to a running sandbox requires recreating the sandbox so the
+bridge listener and environment are installed.
 
 ### Step 5: Push the updated policy
 

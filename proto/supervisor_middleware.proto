@@ -354,10 +354,7 @@ message AgentConversationEvaluation {
   string session_id = 7;
   string turn_id = 8;
   bytes request_body = 9;
-  string source = 10;
-  string delivery = 11;
-  string request_kind = 12;
-  optional uint32 candidate_index = 13;
+  reserved 10 to 13;
 }
 
 // AgentConversationResult carries the authority decision, an optional complete

@@ -221,11 +221,17 @@ Is L7 inspection needed?
 
 ### Middleware Decision
 
-Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests or client WebSocket text messages. Middleware runs after network and L7 policy admission and before provider credential injection.
+Add `network_middlewares` only when the user asks to inspect, transform, redact,
+or independently authorize admitted HTTP requests, client WebSocket text
+messages, or a supported agent-conversation hook. HTTP and WebSocket middleware
+runs after network and L7 policy admission and before provider credential
+injection. Agent admission uses a separate loopback bridge but the same
+middleware registration and runtime generation.
 
 - Use `openshell/regex` without gateway registration for fixed-pattern redaction of UTF-8 HTTP request bodies or complete client-to-upstream WebSocket text messages.
 - Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
 - Confirm that a requested WebSocket implementation exposes a `WEBSOCKET_MESSAGE/PRE_CREDENTIALS` binding. `openshell/regex` exposes this binding. A host-matched HTTP-only implementation may inspect the upgrade GET but does not join the post-upgrade chain; messages pass and OpenShell emits `binding_not_selected` coverage regardless of `on_error`.
+- For agent admission, confirm that the operator implementation exposes one `AGENT_CONVERSATION/AGENT_CONTEXT` binding. Use `fail_closed`, select exactly one provider host without globs or exclusions, and ensure that host has exactly one admitted network endpoint. The manifest supplies the harness, hook, and schema identifiers; do not encode a harness-specific contract in policy. The initial bridge requires combined sandbox topology and supports exactly one configured agent binding.
 - WebSocket middleware runs for both `ws://` and `wss://` and receives complete client text messages only. Binary messages pass under both error modes and emit `unsupported_message_type` coverage for active stages. Upstream-to-client messages remain uninspected. Do not claim that V1 provides all-message WebSocket inspection.
 - Treat `fail_open` on WebSocket as a session-scoped bypass: if the stage stream fails, OpenShell disables it for later messages on that connection and emits a state-change finding. Prefer `fail_closed` for required redaction or authorization.
 - `on_error` governs failures after an advertised operation binding is selected. It does not apply to an unadvertised WebSocket binding or binary-message pass-through. An explicit HTTP, WebSocket preflight, or WebSocket message denial is authoritative under both `fail_open` and `fail_closed`.

@@ -356,6 +356,13 @@ pub struct ChainEntry {
     pub on_error: OnError,
 }
 
+/// One exact agent-conversation capability advertised by a registered service.
+#[derive(Debug, Clone)]
+pub struct AgentConversationBinding {
+    pub middleware_name: String,
+    pub binding: MiddlewareBinding,
+}
+
 impl TryFrom<(&str, &NetworkMiddlewareConfig)> for ChainEntry {
     type Error = miette::Report;
 
@@ -1041,12 +1048,12 @@ fn validate_response_envelope(
     if result.body.len() > MAX_MIDDLEWARE_PAYLOAD_BYTES {
         return Err("response_body_over_capacity");
     }
-    if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
-        return Err("response_reason_over_capacity");
-    }
-    if !result.reason_code.is_empty() && !is_stable_reason_code(&result.reason_code) {
-        return Err("response_reason_code_invalid");
-    }
+    validate_common_response_fields(
+        &result.reason,
+        &result.reason_code,
+        &result.findings,
+        &result.metadata,
+    )?;
     if result.header_mutations.len() > headers::MAX_HEADER_MUTATIONS {
         return Err("header_mutation_count_over_capacity");
     }
@@ -1059,27 +1066,41 @@ fn validate_response_envelope(
     if mutation_bytes > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
         return Err("header_mutation_bytes_over_capacity");
     }
-    if result.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE {
+    if result.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("response_envelope_over_capacity");
+    }
+    Ok(())
+}
+
+fn validate_common_response_fields(
+    reason: &str,
+    reason_code: &str,
+    findings: &[Finding],
+    metadata: &HashMap<String, String>,
+) -> std::result::Result<(), &'static str> {
+    if reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
+        return Err("response_reason_over_capacity");
+    }
+    if !reason_code.is_empty() && !is_stable_reason_code(reason_code) {
+        return Err("response_reason_code_invalid");
+    }
+    if findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE {
         return Err("response_findings_over_capacity");
     }
-    if result
-        .findings
+    if findings
         .iter()
         .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
     {
         return Err("response_finding_over_capacity");
     }
-    if result.metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
+    if metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
         return Err("response_metadata_count_over_capacity");
     }
-    let metadata_bytes = result.metadata.iter().fold(0usize, |total, (key, value)| {
+    let metadata_bytes = metadata.iter().fold(0usize, |total, (key, value)| {
         total.saturating_add(key.len()).saturating_add(value.len())
     });
     if metadata_bytes > MAX_MIDDLEWARE_METADATA_BYTES {
         return Err("response_metadata_bytes_over_capacity");
-    }
-    if result.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
-        return Err("response_envelope_over_capacity");
     }
     Ok(())
 }
@@ -1469,28 +1490,22 @@ impl ChainRunner {
         })
     }
 
-    /// Return middleware attachment names that advertise every requested hook.
-    pub async fn agent_conversation_middleware_names(
-        &self,
-        harness: &str,
-        schema_version: &str,
-        hooks: &[&str],
-    ) -> Result<Vec<String>> {
+    /// Return every exact agent-conversation binding advertised by registered middleware.
+    pub async fn agent_conversation_bindings(&self) -> Result<Vec<AgentConversationBinding>> {
         let manifests = self.manifests().await?;
         Ok(manifests
-            .iter()
-            .filter(|(_, manifest)| {
-                hooks.iter().all(|hook| {
-                    manifest.bindings.iter().any(|binding| {
-                        binding.operation == SupervisorMiddlewareOperation::AgentConversation as i32
-                            && binding.phase == SupervisorMiddlewarePhase::AgentContext as i32
-                            && binding.harness == harness
-                            && binding.hook == *hook
-                            && binding.schema_version == schema_version
-                    })
+            .into_iter()
+            .flat_map(|(state, manifest)| {
+                let middleware_name = Self::attachment_name(&state, &manifest).to_string();
+                manifest.bindings.into_iter().filter_map(move |binding| {
+                    (binding.operation == SupervisorMiddlewareOperation::AgentConversation as i32
+                        && binding.phase == SupervisorMiddlewarePhase::AgentContext as i32)
+                        .then(|| AgentConversationBinding {
+                            middleware_name: middleware_name.clone(),
+                            binding,
+                        })
                 })
             })
-            .map(|(state, manifest)| Self::attachment_name(state, manifest).to_string())
             .collect())
     }
 
@@ -1578,10 +1593,16 @@ impl ChainRunner {
                 "agent conversation response has unspecified decision"
             ));
         }
-        if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES
-            || (!result.reason_code.is_empty() && !is_stable_reason_code(&result.reason_code))
+        if validate_common_response_fields(
+            &result.reason,
+            &result.reason_code,
+            &result.findings,
+            &result.metadata,
+        )
+        .is_err()
             || result.attestation.len() > MAX_AGENT_ATTESTATION_BYTES
             || result.replacement_body.len() > max_payload_bytes
+            || result.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES
         {
             return Err(miette!("agent conversation response is invalid"));
         }
@@ -2833,6 +2854,7 @@ mod tests {
 
     struct AgentService {
         received: std::sync::Mutex<Vec<AgentConversationEvaluation>>,
+        result: AgentConversationResult,
     }
 
     #[tonic::async_trait]
@@ -2856,14 +2878,14 @@ mod tests {
                 phase: SupervisorMiddlewarePhase::AgentContext as i32,
                 max_payload_bytes: 4096,
                 timeout: String::new(),
-                harness: "pi".into(),
+                harness: "example-agent".into(),
                 hook: hook.into(),
-                schema_version: "openshell.pi-input.v1".into(),
+                schema_version: "example.user-input.v1".into(),
             };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/agent".into(),
                 service_version: "test".into(),
-                bindings: vec![binding("rendered_prompt_admission")],
+                bindings: vec![binding("user_input_admission")],
                 expected_audience: String::new(),
             }))
         }
@@ -2896,11 +2918,7 @@ mod tests {
                 .lock()
                 .expect("agent request lock")
                 .push(request.into_inner());
-            Ok(tonic::Response::new(AgentConversationResult {
-                decision: Decision::Allow as i32,
-                attestation: b"receipt".to_vec(),
-                ..Default::default()
-            }))
+            Ok(tonic::Response::new(self.result.clone()))
         }
     }
 
@@ -2908,17 +2926,22 @@ mod tests {
     async fn agent_request_uses_exact_matching_registered_binding() {
         let service = Arc::new(AgentService {
             received: std::sync::Mutex::new(Vec::new()),
+            result: AgentConversationResult {
+                decision: Decision::Allow as i32,
+                attestation: b"receipt".to_vec(),
+                ..Default::default()
+            },
         });
         let runner = ChainRunner::new_protobuf_for_tests(service.clone());
-        let names = runner
-            .agent_conversation_middleware_names(
-                "pi",
-                "openshell.pi-input.v1",
-                &["rendered_prompt_admission"],
-            )
+        let bindings = runner
+            .agent_conversation_bindings()
             .await
             .expect("discover agent middleware");
-        assert_eq!(names, vec!["test/agent"]);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].middleware_name, "test/agent");
+        assert_eq!(bindings[0].binding.harness, "example-agent");
+        assert_eq!(bindings[0].binding.hook, "user_input_admission");
+        assert_eq!(bindings[0].binding.schema_version, "example.user-input.v1");
 
         let result = runner
             .evaluate_agent_conversation(AgentConversationEvaluation {
@@ -2926,14 +2949,16 @@ mod tests {
                 context: Some(RequestContext {
                     request_id: "request-1".into(),
                     sandbox_id: "sandbox-1".into(),
+                    sandbox_name: String::new(),
+                    workspace: String::new(),
                     originating_process: None,
                 }),
                 config: Some(prost_types::Struct::default()),
                 target: Some(AgentConversationTarget {
-                    harness: "pi".into(),
+                    harness: "example-agent".into(),
                     harness_version: "test".into(),
-                    hook: "rendered_prompt_admission".into(),
-                    schema_version: "openshell.pi-input.v1".into(),
+                    hook: "user_input_admission".into(),
+                    schema_version: "example.user-input.v1".into(),
                     scheme: "https".into(),
                     host: "api.openai.com".into(),
                     port: 443,
@@ -2949,6 +2974,46 @@ mod tests {
         assert_eq!(
             service.received.lock().expect("agent request lock").len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_request_rejects_an_oversized_response() {
+        let service = Arc::new(AgentService {
+            received: std::sync::Mutex::new(Vec::new()),
+            result: AgentConversationResult {
+                decision: Decision::Allow as i32,
+                reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES + 1),
+                ..Default::default()
+            },
+        });
+        let runner = ChainRunner::new_protobuf_for_tests(service);
+        let error = runner
+            .evaluate_agent_conversation(AgentConversationEvaluation {
+                phase: SupervisorMiddlewarePhase::AgentContext as i32,
+                context: Some(RequestContext {
+                    request_id: "request-2".into(),
+                    sandbox_id: "sandbox-1".into(),
+                    sandbox_name: String::new(),
+                    workspace: String::new(),
+                    originating_process: None,
+                }),
+                config: Some(prost_types::Struct::default()),
+                target: Some(AgentConversationTarget {
+                    harness: "example-agent".into(),
+                    hook: "user_input_admission".into(),
+                    schema_version: "example.user-input.v1".into(),
+                    ..Default::default()
+                }),
+                middleware_name: "test/agent".into(),
+                request_body: b"{}".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("oversized response must fail");
+        assert!(
+            format!("{error:?}").contains("response is invalid"),
+            "unexpected error: {error:?}"
         );
     }
 

@@ -9,7 +9,24 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Exten
 
 Supervisor middleware adds ordered processing stages to allowed HTTP and WebSocket egress. Middleware runs after network and L7 policy admit traffic and before OpenShell injects provider credentials. A stage can allow or deny an HTTP request or client WebSocket text message, replace its payload, add approved HTTP headers, and report audit-safe findings.
 
-Operator middleware can also advertise versioned agent-harness bindings. For managed Pi, the sandbox supervisor exposes a loopback bridge only when one configured middleware advertises `rendered_prompt_admission` for `openshell.pi-input.v1`. The supervisor sets `OPENSHELL_PI_CONVERSATION_URL`; the sandbox deployment loads the middleware's Pi extension through Pi's standard extension mechanism. Pi itself remains unaware of OpenShell. The MVP admits a rendered, idle, text-only user prompt before Pi stores it; denied prompts never enter chat history, while replacement bodies support redaction. The supervisor stamps sandbox and provider identity before dispatch. Agent admission is fail closed and does not use the HTTP or WebSocket middleware chains. Admission bodies are limited to 32 KiB. Images, queued input, retries, compaction, and automatic continuations after tool calls are intentionally unsupported until a separate model-request boundary is added.
+Operator middleware can also advertise versioned agent-harness bindings. The
+sandbox supervisor exposes a loopback bridge when exactly one configured
+middleware advertises `AGENT_CONVERSATION/AGENT_CONTEXT`. The manifest supplies
+the harness, hook, and schema identifiers. The selected policy config must use
+`fail_closed` and select one exact provider host; the supervisor derives its
+scheme and port from the corresponding admitted network endpoint. The bridge
+sets `OPENSHELL_AGENT_CONVERSATION_URL`, stamps sandbox and provider identity,
+and returns only the structured decision, optional replacement, and opaque
+receipt. It shares the policy and middleware registry generation used for
+provider egress, so an incomplete reload makes admission unavailable.
+
+Managed Pi is the first client of this general contract. For compatibility, the
+supervisor also sets `OPENSHELL_PI_CONVERSATION_URL`. A Pi extension submits a
+rendered, idle, text-only user prompt before Pi stores it; denied prompts never
+enter chat history, while replacement bodies support redaction. Pi remains
+unaware of OpenShell-specific behavior. Admission bodies are limited to 32 KiB
+and to the advertised binding limit. Images, queued input, retries, compaction,
+and automatic continuations after tool calls remain outside this initial hook.
 
 Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
 
@@ -77,12 +94,12 @@ timeout = "500ms"
 | `tls_ca_cert_path` | Optional PEM trust roots for a private HTTPS service. Custom roots replace platform roots and retain hostname verification. |
 | `audience` | Exact audience expected by the service. Defaults to `urn:openshell:extension:middleware:<name>`. |
 | `allow_insecure_transport` | Opt this registration out of extension authentication, permitting a plaintext `http://` endpoint with no bearer credential. Defaults to `false`. Development and trusted-network deployments only. |
-| `max_payload_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies and complete WebSocket text messages. |
+| `max_payload_bytes` | Shared operator limit applied to inspectable logical payloads across every binding exposed by the service, up to the 4 MiB platform maximum. It caps HTTP bodies, complete WebSocket text messages, and agent-conversation bodies. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
 Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies only to `EvaluateHttpRequest`, WebSocket preflight, and each WebSocket message. WebSocket streams have no connection-wide deadline.
 
-The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
+The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a duplicate binding identity. Agent bindings with distinct harness, hook, or schema identifiers may share the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
 
 Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
 
@@ -168,7 +185,7 @@ Middleware decisions are enforced regardless of the endpoint's `enforcement` mod
 
 ## Set Payload Limits
 
-Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session.
+Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session. For `AGENT_CONVERSATION`, it is one versioned hook body or replacement; the initial loopback bridge applies an additional 32 KiB limit.
 
 - Built-in middleware uses its OpenShell-defined limit.
 - Each operator-run registration sets one `max_payload_bytes` ceiling no higher than any binding's advertised `max_payload_bytes` capability.
@@ -205,7 +222,7 @@ Plan startup and updates around these boundaries:
 - Keep required services available before creating or updating policies. The gateway validates implementation-owned config before persisting a policy.
 - Treat `fail_open` as an explicit availability-over-enforcement decision.
 
-When the effective sandbox configuration changes, a running supervisor validates the new service registry before installing it. If the reload fails, the supervisor keeps its last-known-good registry and emits a configuration failure event.
+When the effective sandbox configuration changes, a running supervisor validates the new service registry and agent-admission selection before installing either one. If the reload fails, the supervisor keeps its last-known-good runtime generation and emits a configuration failure event. A fail-closed policy quarantine intentionally invalidates the bridge generation as well.
 
 ## Observe Middleware
 
@@ -226,6 +243,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
 - The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and `AGENT_CONVERSATION/AGENT_CONTEXT`.
+- The initial agent bridge supports exactly one configured agent-conversation binding, one exact provider host, and combined sandbox topology. Adding the first agent binding to a running sandbox requires recreating that sandbox so the loopback listener and environment variable are present.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
 - Selection uses destination host include and exclude patterns.
