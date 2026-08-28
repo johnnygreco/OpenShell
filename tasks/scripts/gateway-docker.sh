@@ -220,6 +220,8 @@ grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
 EOF
 
+bash "${ROOT}/tasks/scripts/append-gateway-config-fragment.sh" "${CONFIG_PATH}"
+
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
 
