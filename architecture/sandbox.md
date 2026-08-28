@@ -182,16 +182,16 @@ registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
 Managed agent admission reuses the operator middleware registry without joining
-the HTTP chain. When exactly one configured operator service advertises an
-`AGENT_CONVERSATION/AGENT_CONTEXT` binding, the sandbox supervisor binds a
-loopback-only bridge inside the workload network namespace. The manifest owns
-the harness, hook, and schema identifiers; policy owns the exact provider host;
-and the supervisor derives the provider scheme and port from the admitted
-network endpoint. The bridge stamps sandbox and provider identity, forwards the
-bounded versioned request to the selected service, and returns only its
-structured decision, optional replacement, and opaque receipt. The bridge and
-egress middleware runner share one runtime generation, so a partial policy or
-registry reload fails closed instead of mixing admission and egress state.
+the HTTP chain. When one configured operator middleware advertises exact
+`AGENT_CONVERSATION/AGENT_CONTEXT` hook and schema bindings, the sandbox
+supervisor binds a loopback-only bridge inside the workload network namespace.
+The bridge stamps sandbox and provider identity, retains an allowed response's
+attestation, and returns a bounded opaque handle with the decision and optional
+replacement. Provider egress strips and resolves that handle, exposing the
+attestation only to the matching middleware stage. Handles are scoped to the
+sandbox, middleware, provider target, and runtime generation and remain
+retryable only for their bounded lifetime, so partial policy or registry reloads
+cannot mix admission and egress state.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.

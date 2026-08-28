@@ -14,10 +14,10 @@ pub use websocket::{
     WebSocketSessionStartOutcome,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use miette::{Result, miette};
 use prost::Message;
@@ -426,6 +426,10 @@ impl DescribedChainEntry {
     pub fn is_resolved(&self) -> bool {
         self.binding.is_some()
     }
+
+    pub fn implementation(&self) -> &str {
+        &self.entry.implementation
+    }
 }
 
 /// Re-checks a middleware-transformed request body against sandbox policy.
@@ -471,6 +475,8 @@ pub struct HttpRequestInput {
     /// still treat these dynamically hop-by-hop fields as protected.
     pub connection_nominated_headers: Vec<String>,
     pub body: Vec<u8>,
+    /// Supervisor-resolved admission scoped to one middleware stage.
+    pub agent_attestation: Option<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -563,7 +569,85 @@ fn request_view_to_evaluation(request: HttpRequestView<'_>) -> HttpRequestEvalua
         headers: request.headers().to_vec(),
         body: request.body().to_vec(),
         middleware_name: request.middleware_name().to_string(),
+        agent_attestation: request.agent_attestation().to_vec(),
     }
+}
+
+const MAX_AGENT_ADMISSION_HANDLES: usize = 1024;
+const AGENT_ADMISSION_HANDLE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+struct AgentAdmissionGrant {
+    sandbox_id: String,
+    middleware_name: String,
+    scheme: String,
+    host: String,
+    port: u16,
+    policy_generation: u64,
+    attestation: Vec<u8>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct AgentAdmissionStore {
+    grants: HashMap<String, AgentAdmissionGrant>,
+    insertion_order: VecDeque<String>,
+}
+
+impl AgentAdmissionStore {
+    fn issue(&mut self, grant: AgentAdmissionGrant) -> String {
+        self.remove_expired(Instant::now());
+        while self.grants.len() >= MAX_AGENT_ADMISSION_HANDLES {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.grants.remove(&oldest);
+        }
+        let handle = uuid::Uuid::new_v4().to_string();
+        self.insertion_order.push_back(handle.clone());
+        self.grants.insert(handle.clone(), grant);
+        handle
+    }
+
+    fn resolve(&mut self, handle: &str, request: &AgentAdmissionRequest<'_>) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        self.remove_expired(now);
+        let grant = self.grants.get(handle)?;
+        (grant.sandbox_id == request.sandbox_id
+            && grant.middleware_name == request.middleware_name
+            && grant.scheme.eq_ignore_ascii_case(request.scheme)
+            && grant.host.eq_ignore_ascii_case(request.host)
+            && grant.port == request.port
+            && grant.policy_generation == request.policy_generation)
+            .then(|| grant.attestation.clone())
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        self.grants.retain(|_, grant| grant.expires_at > now);
+        self.insertion_order
+            .retain(|handle| self.grants.contains_key(handle));
+    }
+}
+
+/// Trusted context used to issue one opaque agent admission handle.
+pub struct AgentAdmissionGrantInput<'a> {
+    pub sandbox_id: &'a str,
+    pub middleware_name: &'a str,
+    pub scheme: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub policy_generation: u64,
+    pub attestation: Vec<u8>,
+}
+
+/// Trusted request context used to resolve an opaque agent admission handle.
+pub struct AgentAdmissionRequest<'a> {
+    pub sandbox_id: &'a str,
+    pub middleware_name: &'a str,
+    pub scheme: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    pub policy_generation: u64,
 }
 
 #[derive(Clone)]
@@ -729,6 +813,7 @@ pub struct MiddlewareRegistry {
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
+    agent_admissions: Arc<StdMutex<AgentAdmissionStore>>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -764,6 +849,7 @@ impl Default for MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            agent_admissions: Arc::new(StdMutex::new(AgentAdmissionStore::default())),
         }
     }
 }
@@ -1252,6 +1338,7 @@ impl MiddlewareRegistry {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            agent_admissions: Arc::new(StdMutex::new(AgentAdmissionStore::default())),
         })
     }
 
@@ -1348,6 +1435,7 @@ impl ChainRunner {
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+                agent_admissions: Arc::new(StdMutex::new(AgentAdmissionStore::default())),
             }),
         }
     }
@@ -1374,7 +1462,45 @@ impl ChainRunner {
         registry.work_admission = Arc::clone(&self.registry.work_admission);
         registry.work_admission_waiters = Arc::clone(&self.registry.work_admission_waiters);
         registry.session_admission = Arc::clone(&self.registry.session_admission);
+        registry.agent_admissions = Arc::clone(&self.registry.agent_admissions);
         Self::from_registry(registry)
+    }
+
+    /// Store a middleware attestation and return the only value exposed to the
+    /// sandbox workload.
+    pub fn issue_agent_admission_handle(
+        &self,
+        input: AgentAdmissionGrantInput<'_>,
+    ) -> Result<String> {
+        let grant = AgentAdmissionGrant {
+            sandbox_id: input.sandbox_id.to_string(),
+            middleware_name: input.middleware_name.to_string(),
+            scheme: input.scheme.to_string(),
+            host: input.host.to_string(),
+            port: input.port,
+            policy_generation: input.policy_generation,
+            attestation: input.attestation,
+            expires_at: Instant::now() + AGENT_ADMISSION_HANDLE_TTL,
+        };
+        self.registry
+            .agent_admissions
+            .lock()
+            .map_err(|_| miette!("agent admission store lock poisoned"))
+            .map(|mut store| store.issue(grant))
+    }
+
+    /// Resolve a workload handle without consuming it so provider retries can
+    /// reuse the same admitted turn within the short handle lifetime.
+    pub fn resolve_agent_admission_handle(
+        &self,
+        handle: &str,
+        request: &AgentAdmissionRequest<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.registry
+            .agent_admissions
+            .lock()
+            .map_err(|_| miette!("agent admission store lock poisoned"))
+            .map(|mut store| store.resolve(handle, request))
     }
 
     /// Reserve one unit of short-lived middleware work.
@@ -1800,6 +1926,7 @@ impl ChainRunner {
             headers,
             connection_nominated_headers,
             body,
+            agent_attestation,
         } = input;
         // The request envelope is moved into one stable chain state. Built-ins
         // borrow these values for every stage; only the gRPC adapter clones them
@@ -1874,6 +2001,12 @@ impl ChainRunner {
                 &headers,
                 &body,
                 &entry.entry.implementation,
+            )
+            .with_agent_attestation(
+                agent_attestation
+                    .as_ref()
+                    .filter(|(middleware, _)| middleware == &entry.entry.implementation)
+                    .map_or(&[], |(_, attestation)| attestation.as_slice()),
             );
             if let Err(reason) = validate_request_view(request) {
                 match apply_on_error(entry, reason, &mut applied) {
@@ -2271,6 +2404,59 @@ mod tests {
             headers: Vec::new(),
             connection_nominated_headers: Vec::new(),
             body: body.as_bytes().to_vec(),
+            agent_attestation: None,
+        }
+    }
+
+    #[test]
+    fn agent_admission_handles_are_scoped_and_retryable() {
+        let runner = ChainRunner::default();
+        let handle = runner
+            .issue_agent_admission_handle(AgentAdmissionGrantInput {
+                sandbox_id: "sandbox-1",
+                middleware_name: "operator/guard",
+                scheme: "https",
+                host: "api.example.com",
+                port: 443,
+                policy_generation: 7,
+                attestation: b"trusted".to_vec(),
+            })
+            .expect("issue handle");
+        let request =
+            |sandbox_id, middleware_name, host, policy_generation| AgentAdmissionRequest {
+                sandbox_id,
+                middleware_name,
+                scheme: "https",
+                host,
+                port: 443,
+                policy_generation,
+            };
+
+        let valid = request("sandbox-1", "operator/guard", "api.example.com", 7);
+        assert_eq!(
+            runner
+                .resolve_agent_admission_handle(&handle, &valid)
+                .unwrap(),
+            Some(b"trusted".to_vec())
+        );
+        assert_eq!(
+            runner
+                .resolve_agent_admission_handle(&handle, &valid)
+                .unwrap(),
+            Some(b"trusted".to_vec())
+        );
+        for invalid in [
+            request("sandbox-2", "operator/guard", "api.example.com", 7),
+            request("sandbox-1", "operator/other", "api.example.com", 7),
+            request("sandbox-1", "operator/guard", "other.example.com", 7),
+            request("sandbox-1", "operator/guard", "api.example.com", 8),
+        ] {
+            assert_eq!(
+                runner
+                    .resolve_agent_admission_handle(&handle, &invalid)
+                    .unwrap(),
+                None
+            );
         }
     }
 
@@ -3610,6 +3796,7 @@ mod tests {
             ("x-api-key".into(), "second-value".into()),
         ];
         request.query = "page=2".into();
+        request.agent_attestation = Some(("test/recorder".into(), b"trusted".to_vec()));
         let original_body = request.body.as_ptr().addr();
 
         let outcome = runner
@@ -3634,6 +3821,7 @@ mod tests {
             SupervisorMiddlewarePhase::PreCredentials as i32
         );
         assert_eq!(received[0].middleware_name, "test/recorder");
+        assert_eq!(received[0].agent_attestation, b"trusted");
         assert_eq!(received[0].config.as_ref(), Some(&evaluation_config));
         let context = received[0].context.as_ref().expect("request context");
         assert_eq!(context.request_id, "req");
@@ -3727,6 +3915,7 @@ mod tests {
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
+            agent_admissions: Arc::new(StdMutex::new(AgentAdmissionStore::default())),
         }
     }
 

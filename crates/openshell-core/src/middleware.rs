@@ -68,6 +68,7 @@ pub struct HttpRequestView<'a> {
     headers: &'a [HttpHeader],
     body: &'a [u8],
     middleware_name: &'a str,
+    agent_attestation: &'a [u8],
 }
 
 impl<'a> HttpRequestView<'a> {
@@ -90,7 +91,15 @@ impl<'a> HttpRequestView<'a> {
             headers,
             body,
             middleware_name,
+            agent_attestation: &[],
         }
+    }
+
+    /// Attach a supervisor-resolved agent admission attestation to this view.
+    #[must_use]
+    pub fn with_agent_attestation(mut self, agent_attestation: &'a [u8]) -> Self {
+        self.agent_attestation = agent_attestation;
+        self
     }
 
     /// Return the typed middleware phase selected for this invocation.
@@ -134,6 +143,13 @@ impl<'a> HttpRequestView<'a> {
     #[must_use]
     pub fn middleware_name(self) -> &'a str {
         self.middleware_name
+    }
+
+    /// Return the supervisor-resolved agent admission attestation for this
+    /// middleware stage. The value is empty for ordinary requests.
+    #[must_use]
+    pub fn agent_attestation(self) -> &'a [u8] {
+        self.agent_attestation
     }
 }
 

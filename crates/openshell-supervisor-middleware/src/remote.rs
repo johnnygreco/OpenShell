@@ -90,6 +90,7 @@ impl GrpcMiddlewareService {
                 headers: request.headers().to_vec(),
                 body: request.body().to_vec(),
                 middleware_name: request.middleware_name().to_string(),
+                agent_attestation: request.agent_attestation().to_vec(),
             }))
             .await
     }

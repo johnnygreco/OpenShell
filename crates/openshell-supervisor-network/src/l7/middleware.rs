@@ -14,6 +14,8 @@ use openshell_ocsf::{
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+const AGENT_ADMISSION_HANDLE_HEADER: &str = "x-openshell-agent-admission-handle";
+
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied {
@@ -456,6 +458,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     generation_guard: &PolicyGenerationGuard,
     transformed_body_policy: openshell_supervisor_middleware::TransformedBodyPolicy<'_>,
 ) -> Result<MiddlewareApplyResult> {
+    let (req, admission_handle) = take_agent_admission_handle(req)?;
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
@@ -525,7 +528,26 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input(
+    let agent_attestation = admission_handle.as_deref().and_then(|handle| {
+        chain.iter().find_map(|entry| {
+            runner
+                .resolve_agent_admission_handle(
+                    handle,
+                    &openshell_supervisor_middleware::AgentAdmissionRequest {
+                        sandbox_id: &openshell_ocsf::ctx::ctx().sandbox_id,
+                        middleware_name: entry.implementation(),
+                        scheme,
+                        host: &ctx.host,
+                        port: ctx.port,
+                        policy_generation: generation_guard.captured_generation(),
+                    },
+                )
+                .ok()
+                .flatten()
+                .map(|attestation| (entry.implementation().to_string(), attestation))
+        })
+    });
+    let mut input = middleware_request_input(
         openshell_ocsf::ctx::ctx(),
         scheme,
         &req,
@@ -535,6 +557,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         query,
         buffered.body,
     );
+    input.agent_attestation = agent_attestation;
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
@@ -634,7 +657,39 @@ pub(super) fn middleware_request_input(
         headers,
         connection_nominated_headers,
         body,
+        agent_attestation: None,
     }
+}
+
+fn take_agent_admission_handle(
+    mut request: crate::l7::provider::L7Request,
+) -> Result<(crate::l7::provider::L7Request, Option<String>)> {
+    let header_end = request
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+        .ok_or_else(|| miette!("HTTP request headers are incomplete"))?;
+    let header_bytes = &request.raw_header[..header_end];
+    let header_text = std::str::from_utf8(header_bytes)
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let values = header_text
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| {
+            name.trim()
+                .eq_ignore_ascii_case(AGENT_ADMISSION_HANDLE_HEADER)
+        })
+        .map(|(_, value)| value.trim().to_string())
+        .collect::<Vec<_>>();
+    if values.len() > 1 || values.first().is_some_and(String::is_empty) {
+        return Err(miette!("invalid agent admission handle header"));
+    }
+    let mut stripped = crate::l7::rest::strip_header(header_bytes, AGENT_ADMISSION_HANDLE_HEADER)?;
+    stripped.extend_from_slice(&request.raw_header[header_end..]);
+    request.raw_header = stripped;
+    Ok((request, values.into_iter().next()))
 }
 
 pub(super) fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
@@ -893,12 +948,46 @@ fn emit_middleware_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        middleware_admission_exhausted_event, safe_middleware_headers,
-        send_middleware_rejection_response, websocket_coverage_events,
-        websocket_message_finding_events, websocket_preflight_finding_events,
+        AGENT_ADMISSION_HANDLE_HEADER, middleware_admission_exhausted_event,
+        safe_middleware_headers, send_middleware_rejection_response, take_agent_admission_handle,
+        websocket_coverage_events, websocket_message_finding_events,
+        websocket_preflight_finding_events,
     };
     use crate::l7::relay::L7EvalContext;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn agent_admission_handle_is_removed_without_losing_body_overflow() {
+        let request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"POST /v1/messages HTTP/1.1\r\nHost: api.example.com\r\nX-OpenShell-Agent-Admission-Handle: opaque\r\nContent-Length: 4\r\n\r\nbody".to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(4),
+        };
+
+        let (request, handle) = take_agent_admission_handle(request).expect("valid headers");
+        assert_eq!(handle.as_deref(), Some("opaque"));
+        assert!(
+            !String::from_utf8_lossy(&request.raw_header)
+                .to_ascii_lowercase()
+                .contains(AGENT_ADMISSION_HANDLE_HEADER)
+        );
+        assert!(request.raw_header.ends_with(b"\r\n\r\nbody"));
+    }
+
+    #[test]
+    fn duplicate_agent_admission_handles_are_rejected() {
+        let request = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"POST /v1/messages HTTP/1.1\r\nX-OpenShell-Agent-Admission-Handle: one\r\nx-openshell-agent-admission-handle: two\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        assert!(take_agent_admission_handle(request).is_err());
+    }
 
     #[test]
     fn admission_exhaustion_event_contains_only_platform_context() {

@@ -26,20 +26,28 @@ pub const BRIDGE_URL: &str = "http://127.0.0.1:8193/v1/agent/conversation";
 pub const BRIDGE_URL_ENV: &str = "OPENSHELL_AGENT_CONVERSATION_URL";
 pub const LEGACY_PI_BRIDGE_URL_ENV: &str = "OPENSHELL_PI_CONVERSATION_URL";
 
-const MAX_BRIDGE_BODY_BYTES: usize = 256 * 1024;
-const MAX_ADMISSION_BODY_BYTES: usize = 32 * 1024;
+// Vec<u8> is encoded as a JSON number array by the existing bridge contract,
+// so its transport envelope can be roughly five times the logical payload.
+const MAX_ADMISSION_BODY_BYTES: usize =
+    openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
+const MAX_BRIDGE_BODY_BYTES: usize = MAX_ADMISSION_BODY_BYTES * 5 + 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BridgeSelection {
     pub middleware_name: String,
-    pub harness: String,
-    pub hook: String,
-    pub schema_version: String,
+    pub bindings: Vec<BridgeBinding>,
     pub provider_scheme: String,
     pub provider_host: String,
     pub provider_port: u32,
-    pub max_payload_bytes: usize,
     pub middleware_config: prost_types::Struct,
+}
+
+#[derive(Debug, Clone)]
+pub struct BridgeBinding {
+    pub harness: String,
+    pub hook: String,
+    pub schema_version: String,
+    pub max_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +69,8 @@ struct BridgeState {
 #[serde(deny_unknown_fields)]
 struct BridgeRequest {
     harness_version: String,
+    hook: String,
+    schema_version: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -74,7 +84,7 @@ struct BridgeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     replacement_body: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    receipt: Option<Vec<u8>>,
+    handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,7 +130,7 @@ async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequ
     let Some(selection) = runtime.selection else {
         return admission_unavailable();
     };
-    if !is_valid_admission_request(&input, selection.max_payload_bytes) {
+    let Some(binding) = selected_binding(&selection, &input) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(BridgeError {
@@ -128,7 +138,7 @@ async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequ
             }),
         )
             .into_response();
-    }
+    };
 
     let Ok(generation) = state.engine.generation_guard(runtime.generation) else {
         return admission_unavailable();
@@ -145,6 +155,7 @@ async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequ
         &state.sandbox_name,
         &workspace,
         &selection,
+        binding,
         input,
     );
 
@@ -159,7 +170,13 @@ async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequ
         return admission_unavailable();
     }
 
-    match bridge_result(result) {
+    match bridge_result(
+        &runner,
+        &state.sandbox_id,
+        runtime.generation,
+        &selection,
+        result,
+    ) {
         Ok(result) => Json(result).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(BridgeError { error })).into_response(),
     }
@@ -170,6 +187,7 @@ fn build_evaluation(
     sandbox_name: &str,
     workspace: &str,
     selection: &BridgeSelection,
+    binding: &BridgeBinding,
     input: BridgeRequest,
 ) -> AgentConversationEvaluation {
     AgentConversationEvaluation {
@@ -183,10 +201,10 @@ fn build_evaluation(
         }),
         config: Some(selection.middleware_config.clone()),
         target: Some(AgentConversationTarget {
-            harness: selection.harness.clone(),
+            harness: binding.harness.clone(),
             harness_version: input.harness_version,
-            hook: selection.hook.clone(),
-            schema_version: selection.schema_version.clone(),
+            hook: binding.hook.clone(),
+            schema_version: binding.schema_version.clone(),
             scheme: selection.provider_scheme.clone(),
             host: selection.provider_host.clone(),
             port: selection.provider_port,
@@ -199,21 +217,47 @@ fn build_evaluation(
     }
 }
 
-fn bridge_result(result: AgentConversationResult) -> Result<BridgeResponse, &'static str> {
+fn bridge_result(
+    runner: &openshell_supervisor_middleware::ChainRunner,
+    sandbox_id: &str,
+    policy_generation: u64,
+    selection: &BridgeSelection,
+    result: AgentConversationResult,
+) -> Result<BridgeResponse, &'static str> {
     match Decision::try_from(result.decision).unwrap_or(Decision::Unspecified) {
-        Decision::Allow => Ok(BridgeResponse {
-            decision: "allow",
-            replacement_body: result
-                .has_replacement_body
-                .then_some(result.replacement_body),
-            receipt: (!result.attestation.is_empty()).then_some(result.attestation),
-            reason_code: None,
-            metadata: (!result.metadata.is_empty()).then_some(result.metadata),
-        }),
+        Decision::Allow => {
+            if result.attestation.is_empty() {
+                return Err("missing_admission_attestation");
+            }
+            let port =
+                u16::try_from(selection.provider_port).map_err(|_| "invalid_provider_port")?;
+            let handle = runner
+                .issue_agent_admission_handle(
+                    openshell_supervisor_middleware::AgentAdmissionGrantInput {
+                        sandbox_id,
+                        middleware_name: &selection.middleware_name,
+                        scheme: &selection.provider_scheme,
+                        host: &selection.provider_host,
+                        port,
+                        policy_generation,
+                        attestation: result.attestation,
+                    },
+                )
+                .map_err(|_| "admission_store_unavailable")?;
+            Ok(BridgeResponse {
+                decision: "allow",
+                replacement_body: result
+                    .has_replacement_body
+                    .then_some(result.replacement_body),
+                handle: Some(handle),
+                reason_code: None,
+                metadata: (!result.metadata.is_empty()).then_some(result.metadata),
+            })
+        }
         Decision::Deny => Ok(BridgeResponse {
             decision: "deny",
             replacement_body: None,
-            receipt: None,
+            handle: None,
             reason_code: (!result.reason_code.is_empty()).then_some(result.reason_code),
             metadata: None,
         }),
@@ -231,11 +275,21 @@ fn admission_unavailable() -> Response {
         .into_response()
 }
 
-fn is_valid_admission_request(input: &BridgeRequest, binding_limit: usize) -> bool {
-    is_stable_identifier(&input.harness_version)
-        && !input.request_body.is_empty()
-        && input.request_body.len() <= MAX_ADMISSION_BODY_BYTES
-        && input.request_body.len() <= binding_limit
+fn selected_binding<'a>(
+    selection: &'a BridgeSelection,
+    input: &BridgeRequest,
+) -> Option<&'a BridgeBinding> {
+    if !is_stable_identifier(&input.harness_version)
+        || input.request_body.is_empty()
+        || input.request_body.len() > MAX_ADMISSION_BODY_BYTES
+    {
+        return None;
+    }
+    selection.bindings.iter().find(|binding| {
+        binding.hook == input.hook
+            && binding.schema_version == input.schema_version
+            && input.request_body.len() <= binding.max_payload_bytes
+    })
 }
 
 fn is_stable_identifier(value: &str) -> bool {
@@ -253,6 +307,8 @@ mod tests {
     fn request(harness_version: &str, body_len: usize) -> BridgeRequest {
         BridgeRequest {
             harness_version: harness_version.into(),
+            hook: "user_input".into(),
+            schema_version: "example.input.v1".into(),
             session_id: String::new(),
             submission_id: String::new(),
             request_body: vec![b'x'; body_len],
@@ -261,46 +317,59 @@ mod tests {
 
     #[test]
     fn admission_request_requires_a_stable_harness_version() {
-        assert!(!is_valid_admission_request(&request("", 1), 1));
-        assert!(!is_valid_admission_request(&request("bad version", 1), 1));
-        assert!(is_valid_admission_request(&request("extension-v1", 1), 1));
+        let selection = selection(1);
+        assert!(selected_binding(&selection, &request("", 1)).is_none());
+        assert!(selected_binding(&selection, &request("bad version", 1)).is_none());
+        assert!(selected_binding(&selection, &request("sdk-v1", 1)).is_some());
+        let mut unadvertised = request("sdk-v1", 1);
+        unadvertised.schema_version = "other.v1".into();
+        assert!(selected_binding(&selection, &unadvertised).is_none());
     }
 
     #[test]
     fn admission_request_enforces_the_logical_body_limit() {
-        assert!(!is_valid_admission_request(
-            &request("extension-v1", 0),
-            usize::MAX
-        ));
-        assert!(is_valid_admission_request(
-            &request("extension-v1", MAX_ADMISSION_BODY_BYTES,),
-            usize::MAX
-        ));
-        assert!(!is_valid_admission_request(
-            &request("extension-v1", MAX_ADMISSION_BODY_BYTES + 1,),
-            usize::MAX
-        ));
-        assert!(!is_valid_admission_request(&request("extension-v1", 2), 1));
+        let max_selection = selection(MAX_ADMISSION_BODY_BYTES);
+        assert!(selected_binding(&max_selection, &request("sdk-v1", 0)).is_none());
+        assert!(
+            selected_binding(&max_selection, &request("sdk-v1", MAX_ADMISSION_BODY_BYTES))
+                .is_some()
+        );
+        assert!(
+            selected_binding(
+                &max_selection,
+                &request("sdk-v1", MAX_ADMISSION_BODY_BYTES + 1)
+            )
+            .is_none()
+        );
+        assert!(selected_binding(&selection(1), &request("sdk-v1", 2)).is_none());
+    }
+
+    fn selection(limit: usize) -> BridgeSelection {
+        BridgeSelection {
+            middleware_name: "operator/guard".into(),
+            bindings: vec![BridgeBinding {
+                harness: "another-agent".into(),
+                hook: "user_input".into(),
+                schema_version: "example.input.v1".into(),
+                max_payload_bytes: limit,
+            }],
+            provider_scheme: "https".into(),
+            provider_host: "api.example.com".into(),
+            provider_port: 8443,
+            middleware_config: prost_types::Struct::default(),
+        }
     }
 
     #[test]
     fn evaluation_uses_advertised_binding_and_trusted_destination() {
-        let selection = BridgeSelection {
-            middleware_name: "operator/guard".into(),
-            harness: "another-agent".into(),
-            hook: "user_input".into(),
-            schema_version: "example.input.v1".into(),
-            provider_scheme: "https".into(),
-            provider_host: "api.example.com".into(),
-            provider_port: 8443,
-            max_payload_bytes: 1024,
-            middleware_config: prost_types::Struct::default(),
-        };
+        let selection = selection(1024);
+        let binding = &selection.bindings[0];
         let evaluation = build_evaluation(
             "sandbox-1",
             "friendly-sandbox",
             "workspace-1",
             &selection,
+            binding,
             request("plugin-v2", 2),
         );
         let target = evaluation.target.expect("target");
@@ -314,28 +383,63 @@ mod tests {
     }
 
     #[test]
-    fn result_mapping_preserves_only_operation_outputs() {
-        let allow = bridge_result(AgentConversationResult {
-            decision: Decision::Allow as i32,
-            attestation: b"receipt".to_vec(),
-            replacement_body: b"redacted".to_vec(),
-            has_replacement_body: true,
-            ..Default::default()
-        })
+    fn result_mapping_returns_an_opaque_retryable_handle() {
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let selection = selection(1024);
+        let allow = bridge_result(
+            &runner,
+            "sandbox-1",
+            7,
+            &selection,
+            AgentConversationResult {
+                decision: Decision::Allow as i32,
+                attestation: b"receipt".to_vec(),
+                replacement_body: b"redacted".to_vec(),
+                has_replacement_body: true,
+                ..Default::default()
+            },
+        )
         .expect("allow");
         assert_eq!(allow.decision, "allow");
-        assert_eq!(allow.receipt, Some(b"receipt".to_vec()));
+        let handle = allow.handle.expect("handle");
+        assert_ne!(handle.as_bytes(), b"receipt");
+        let request = openshell_supervisor_middleware::AgentAdmissionRequest {
+            sandbox_id: "sandbox-1",
+            middleware_name: "operator/guard",
+            scheme: "https",
+            host: "api.example.com",
+            port: 8443,
+            policy_generation: 7,
+        };
+        assert_eq!(
+            runner
+                .resolve_agent_admission_handle(&handle, &request)
+                .unwrap(),
+            Some(b"receipt".to_vec())
+        );
+        assert_eq!(
+            runner
+                .resolve_agent_admission_handle(&handle, &request)
+                .unwrap(),
+            Some(b"receipt".to_vec())
+        );
         assert_eq!(allow.replacement_body, Some(b"redacted".to_vec()));
 
-        let deny = bridge_result(AgentConversationResult {
-            decision: Decision::Deny as i32,
-            reason_code: "policy_denied".into(),
-            ..Default::default()
-        })
+        let deny = bridge_result(
+            &runner,
+            "sandbox-1",
+            7,
+            &selection,
+            AgentConversationResult {
+                decision: Decision::Deny as i32,
+                reason_code: "policy_denied".into(),
+                ..Default::default()
+            },
+        )
         .expect("deny");
         assert_eq!(deny.decision, "deny");
         assert_eq!(deny.reason_code.as_deref(), Some("policy_denied"));
-        assert_eq!(deny.receipt, None);
+        assert_eq!(deny.handle, None);
         assert_eq!(deny.replacement_body, None);
     }
 }

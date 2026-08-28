@@ -93,21 +93,17 @@ async fn select_agent_bridge(
     policy: &openshell_core::proto::SandboxPolicy,
 ) -> Result<Option<agent_bridge::BridgeSelection>> {
     let bindings = runner.agent_conversation_bindings().await?;
-    let mut matches = policy
-        .network_middlewares
-        .iter()
-        .flat_map(|(config_name, config)| {
-            bindings
-                .iter()
-                .filter(move |binding| binding.middleware_name == config.middleware)
-                .map(move |binding| (config_name, config, binding))
-        });
-    let Some((config_name, config, advertised)) = matches.next() else {
+    let mut matches = policy.network_middlewares.iter().filter(|(_, config)| {
+        bindings
+            .iter()
+            .any(|binding| binding.middleware_name == config.middleware)
+    });
+    let Some((config_name, config)) = matches.next() else {
         return Ok(None);
     };
     if matches.next().is_some() {
         return Err(miette::miette!(
-            "managed agent admission requires exactly one configured agent-conversation binding"
+            "managed agent admission requires exactly one configured agent-conversation middleware"
         ));
     }
     if OnError::parse(&config.on_error)? != OnError::FailClosed {
@@ -128,17 +124,26 @@ async fn select_agent_bridge(
     }
     let provider_host = &endpoints.include[0];
     let (provider_scheme, provider_port) = exact_provider_endpoint(policy, provider_host)?;
-    let max_payload_bytes = usize::try_from(advertised.binding.max_payload_bytes)
-        .map_err(|_| miette::miette!("agent admission binding payload limit is unsupported"))?;
+    let advertised = bindings
+        .into_iter()
+        .filter(|binding| binding.middleware_name == config.middleware)
+        .map(|advertised| {
+            Ok(agent_bridge::BridgeBinding {
+                harness: advertised.binding.harness,
+                hook: advertised.binding.hook,
+                schema_version: advertised.binding.schema_version,
+                max_payload_bytes: usize::try_from(advertised.binding.max_payload_bytes).map_err(
+                    |_| miette::miette!("agent admission binding payload limit is unsupported"),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(Some(agent_bridge::BridgeSelection {
         middleware_name: config.middleware.clone(),
-        harness: advertised.binding.harness.clone(),
-        hook: advertised.binding.hook.clone(),
-        schema_version: advertised.binding.schema_version.clone(),
+        bindings: advertised,
         provider_scheme,
         provider_host: provider_host.clone(),
         provider_port,
-        max_payload_bytes,
         middleware_config: config.config.clone().unwrap_or_default(),
     }))
 }
