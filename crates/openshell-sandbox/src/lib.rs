@@ -680,6 +680,16 @@ pub async fn run_sandbox(
                 generation: engine.current_generation(),
                 selection: Some(selection),
             });
+        if let Some(engine_ready) = networking
+            .as_ref()
+            .map(|networking| networking.engine_ready.clone())
+        {
+            synchronize_agent_bridge_after_engine_ready(
+                runtime_tx.clone(),
+                engine.clone(),
+                engine_ready,
+            );
+        }
         agent_bridge::spawn(
             listener,
             engine,
@@ -3764,6 +3774,42 @@ fn synchronize_agent_bridge_generation(
     }
 }
 
+fn synchronize_agent_bridge_after_engine_ready(
+    runtime: tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>,
+    engine: Arc<OpaEngine>,
+    mut engine_ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let initial_generation = engine.current_generation();
+    tokio::spawn(async move {
+        if !*engine_ready.borrow() && engine_ready.changed().await.is_err() {
+            return;
+        }
+        if !*engine_ready.borrow() {
+            return;
+        }
+        let active_generation = engine.current_generation();
+        synchronize_agent_bridge_generation_if_unchanged(
+            &runtime,
+            initial_generation,
+            active_generation,
+        );
+    });
+}
+
+fn synchronize_agent_bridge_generation_if_unchanged(
+    runtime: &tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>,
+    expected_generation: u64,
+    active_generation: u64,
+) {
+    runtime.send_if_modified(|snapshot| {
+        if snapshot.generation != expected_generation || snapshot.generation == active_generation {
+            return false;
+        }
+        snapshot.generation = active_generation;
+        true
+    });
+}
+
 fn policy_validation_failure_events(
     disposition: &PolicyValidationFailureDisposition,
     version: u32,
@@ -4716,6 +4762,21 @@ mod tests {
             active_generation: 4,
         };
         synchronize_agent_bridge_generation(Some(&runtime), &fail_closed);
+        assert_eq!(receiver.borrow().generation, 3);
+    }
+
+    #[test]
+    fn entrypoint_policy_rebuild_only_updates_the_generation_it_started_from() {
+        let (runtime, receiver) =
+            tokio::sync::watch::channel(agent_bridge::BridgeRuntimeSnapshot {
+                generation: 2,
+                selection: None,
+            });
+
+        synchronize_agent_bridge_generation_if_unchanged(&runtime, 2, 3);
+        assert_eq!(receiver.borrow().generation, 3);
+
+        synchronize_agent_bridge_generation_if_unchanged(&runtime, 2, 4);
         assert_eq!(receiver.borrow().generation, 3);
     }
 

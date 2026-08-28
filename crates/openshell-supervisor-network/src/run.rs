@@ -151,6 +151,10 @@ pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Becomes true after the entrypoint-aware policy rebuild finishes or is
+    /// skipped. Consumers whose state is generation-bound must synchronize
+    /// after this transition.
+    pub engine_ready: tokio::sync::watch::Receiver<bool>,
     /// Policy-local route context: shared with the orchestrator's policy poll
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
@@ -217,6 +221,7 @@ pub async fn run_networking(
     // the race where an in-flight request observes a generation transition
     // during the OPA engine reload.
     let (engine_ready_tx, engine_ready_rx) = tokio::sync::watch::channel(false);
+    let networking_engine_ready_rx = engine_ready_rx.clone();
     #[cfg(target_os = "linux")]
     let transparent_engine_ready_rx = engine_ready_rx.clone();
     #[cfg(target_os = "linux")]
@@ -491,6 +496,7 @@ pub async fn run_networking(
     Ok(Networking {
         proxy: proxy_handle,
         ca_file_paths,
+        engine_ready: networking_engine_ready_rx,
         policy_local_ctx,
         #[cfg(target_os = "linux")]
         _policy_dns: policy_dns,
