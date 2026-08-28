@@ -921,16 +921,10 @@ fn validate_manifest_bindings(
         )) {
             return Err(miette!("{source} describes a duplicate middleware binding"));
         }
-        let advertised = validate_payload_limit(source, binding)?;
+        validate_payload_limit(source, binding)?;
         if !binding.timeout.trim().is_empty() {
             parse_middleware_timeout(&binding.timeout)
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
-        }
-        if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
-            return Err(miette!(
-                "{source} max_payload_bytes ({}) exceeds the binding capability ({advertised})",
-                operator_max_payload_bytes.expect("operator limit checked above")
-            ));
         }
         if operator_max_payload_bytes == Some(0) {
             return Err(miette!(
@@ -1678,7 +1672,9 @@ impl ChainRunner {
             };
             let timeout = state.timeout_for_binding(&binding)?;
             let advertised = validate_payload_limit("middleware manifest", &binding)?;
-            let max_payload_bytes = state.operator_max_payload_bytes.unwrap_or(advertised);
+            let max_payload_bytes = state
+                .operator_max_payload_bytes
+                .map_or(advertised, |operator_limit| operator_limit.min(advertised));
             described_entries.push(DescribedChainEntry {
                 entry,
                 service: Some(Arc::clone(state)),
@@ -3910,24 +3906,31 @@ mod tests {
         assert!(outcome.applied[1].failed);
     }
 
-    #[test]
-    fn external_manifest_rejects_operator_limit_above_capability() {
+    #[tokio::test]
+    async fn external_binding_caps_operator_limit_at_advertised_capability() {
         let registration = external_registration(4097);
-        let manifest = MiddlewareManifest {
-            name: "example/service".into(),
-            service_version: "test".into(),
-            bindings: vec![MiddlewareBinding {
-                operation: HTTP_REQUEST_OPERATION as i32,
-                phase: PRE_CREDENTIALS_PHASE as i32,
-                max_payload_bytes: 4096,
-                timeout: String::new(),
-                ..Default::default()
-            }],
-            expected_audience: String::new(),
-        };
-        let error = validate_external_manifest(&registration, &manifest, 4097, false)
-            .expect_err("operator limit must fit capability");
-        assert!(error.to_string().contains("exceeds"));
+        let registry = registry_with_external(
+            Arc::new(ScriptedService {
+                manifest_name: "example/service".into(),
+                max_body_bytes: 4096,
+                result: allow_result(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let described = runner
+            .describe_chain(&[ChainEntry {
+                name: "external".into(),
+                implementation: "local-guard-service".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            }])
+            .await
+            .expect("describe external binding");
+
+        assert_eq!(described[0].max_payload_bytes(), 4096);
     }
 
     #[test]
@@ -4030,7 +4033,7 @@ mod tests {
     }
 
     #[test]
-    fn external_websocket_binding_rejects_operator_limit_above_capability() {
+    fn external_websocket_binding_accepts_operator_limit_above_capability() {
         let registration = external_registration(4097);
         let manifest = MiddlewareManifest {
             name: "example/websocket".into(),
@@ -4045,9 +4048,8 @@ mod tests {
             expected_audience: String::new(),
         };
 
-        let error = validate_external_manifest(&registration, &manifest, 4097, false)
-            .expect_err("operator payload limit must fit WebSocket capability");
-        assert!(error.to_string().contains("exceeds"));
+        validate_external_manifest(&registration, &manifest, 4097, false)
+            .expect("binding capability provides the effective WebSocket limit");
     }
 
     #[test]
