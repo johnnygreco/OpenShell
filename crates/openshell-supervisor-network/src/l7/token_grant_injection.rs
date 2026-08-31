@@ -8,7 +8,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
-use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+use openshell_core::proto::{
+    ProviderCredentialDelivery, ProviderCredentialTokenGrant, ProviderProfileCredential,
+};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, Url as OcsfUrl, ctx::ctx as ocsf_ctx, ocsf_emit,
@@ -162,6 +164,55 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
     Ok(req)
 }
 
+/// Injects an endpoint-bound static credential that opted into proxy delivery.
+pub fn inject_static_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
+    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    let credential = ctx.dynamic_credentials.as_ref().and_then(|credentials| {
+        credentials.read().map_or(None, |credentials| {
+            credentials
+                .iter()
+                .filter_map(|(key, credential)| {
+                    let score =
+                        dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
+                    (ProviderCredentialDelivery::try_from(credential.delivery).unwrap_or_default()
+                        == ProviderCredentialDelivery::Proxy)
+                        .then(|| (score, key.clone(), credential.clone()))
+                })
+                .max_by_key(|(score, key, _)| (*score, key.clone()))
+                .map(|(_, key, credential)| (key, credential))
+        })
+    });
+
+    let Some((provider_key, credential)) = credential else {
+        return Ok(req);
+    };
+    let resolver = ctx
+        .secret_resolver
+        .as_deref()
+        .ok_or_else(|| miette!("proxy-delivered credential unavailable for {provider_key}"))?;
+    let value = credential
+        .env_vars
+        .iter()
+        .find_map(|key| {
+            resolver
+                .resolve_current_env_key_checked(key, "proxy-delivered credential")
+                .transpose()
+        })
+        .transpose()?
+        .ok_or_else(|| miette!("proxy-delivered credential unavailable for {provider_key}"))?;
+    let (header_name, header_value) =
+        injected_credential_header(&credential, value, "proxy delivery")?;
+    let raw_header = inject_header(&req.raw_header, &header_name, &header_value)?;
+
+    Ok(L7Request {
+        action: req.action,
+        target: req.target,
+        query_params: req.query_params,
+        raw_header,
+        body_length: req.body_length,
+    })
+}
+
 fn ocsf_message_field(value: &str) -> String {
     value
         .chars()
@@ -245,42 +296,55 @@ fn inject_token_grant_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<Vec<u8>> {
-    crate::token_grant::validate_access_token(access_token)?;
-    let (header_name, header_value) = token_grant_header(credential, access_token)?;
+    let (header_name, header_value) =
+        injected_credential_header(credential, access_token, "token grant")?;
     inject_header(raw_header, &header_name, &header_value)
 }
 
-fn token_grant_header(
+fn injected_credential_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
+    context: &str,
 ) -> Result<(String, String)> {
     match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" => {
+            crate::token_grant::validate_access_token(access_token)?;
             let header_name = if credential.header_name.trim().is_empty() {
                 "Authorization"
             } else {
                 credential.header_name.trim()
             };
-            validate_header_name(header_name)?;
+            validate_header_name(header_name, context)?;
             Ok((header_name.to_string(), format!("Bearer {access_token}")))
         }
         "header" => {
             let header_name = credential.header_name.trim();
             if header_name.is_empty() {
-                return Err(miette!(
-                    "token grant auth_style header requires header_name"
-                ));
+                return Err(miette!("{context} auth_style header requires header_name"));
             }
-            validate_header_name(header_name)?;
+            validate_header_name(header_name, context)?;
+            validate_header_value(access_token, context)?;
             Ok((header_name.to_string(), access_token.to_string()))
         }
         other => Err(miette!(
-            "token grant auth_style '{other}' is not supported; use bearer or header"
+            "{context} auth_style '{other}' is not supported; use bearer or header"
         )),
     }
 }
 
-fn validate_header_name(header_name: &str) -> Result<()> {
+fn validate_header_value(value: &str, context: &str) -> Result<()> {
+    if value
+        .bytes()
+        .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
+    {
+        return Err(miette!(
+            "{context} credential contains invalid HTTP header value characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_header_name(header_name: &str, context: &str) -> Result<()> {
     let valid = !header_name.is_empty()
         && header_name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
@@ -304,12 +368,12 @@ fn validate_header_name(header_name: &str) -> Result<()> {
         });
     if !valid {
         return Err(miette!(
-            "token grant header_name is not a valid HTTP header name"
+            "{context} header_name is not a valid HTTP header name"
         ));
     }
     match header_name.to_ascii_lowercase().as_str() {
         "host" | "content-length" | "transfer-encoding" | "connection" => Err(miette!(
-            "token grant header_name may not override HTTP framing or connection headers"
+            "{context} header_name may not override HTTP framing or connection headers"
         )),
         _ => Ok(()),
     }
@@ -573,6 +637,8 @@ mod tests {
     use super::*;
     use crate::l7::provider::{BodyLength, L7Request};
     use crate::l7::token_grant_injection::test_support::TokenGrantTestFixture;
+    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use openshell_core::provider_credentials::ProviderCredentialState;
 
     fn credential(auth_style: &str, header_name: &str) -> ProviderProfileCredential {
         ProviderProfileCredential {
@@ -749,13 +815,45 @@ mod tests {
     #[test]
     fn token_grant_header_rejects_framing_and_connection_headers() {
         for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
-            let err = token_grant_header(&credential("header", header_name), "grant-token")
-                .expect_err("framing header override should be rejected");
+            let err = injected_credential_header(
+                &credential("header", header_name),
+                "grant-token",
+                "token grant",
+            )
+            .expect_err("framing header override should be rejected");
             assert_eq!(
                 err.to_string(),
                 "token grant header_name may not override HTTP framing or connection headers"
             );
         }
+    }
+
+    #[test]
+    fn proxy_delivery_named_header_accepts_safe_non_token_value() {
+        let header = injected_credential_header(
+            &credential("header", "x-api-key"),
+            "key with spaces = allowed",
+            "proxy delivery",
+        )
+        .expect("safe HTTP field value");
+        assert_eq!(
+            header,
+            (
+                "x-api-key".to_string(),
+                "key with spaces = allowed".to_string()
+            )
+        );
+
+        let error = injected_credential_header(
+            &credential("header", "x-api-key"),
+            "safe\r\ninjected: value",
+            "proxy delivery",
+        )
+        .expect_err("CRLF injection must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "proxy delivery credential contains invalid HTTP header value characters"
+        );
     }
 
     #[test]
@@ -800,6 +898,67 @@ mod tests {
             err.to_string(),
             "token grant returned a malformed access token"
         );
+    }
+
+    #[test]
+    fn proxy_delivery_replaces_header_without_changing_body() {
+        let dynamic_credentials =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
+                "api.example.com\t443\t/v1/**\tprovider:api_key".to_string(),
+                ProviderProfileCredential {
+                    name: "api_key".to_string(),
+                    env_vars: vec!["API_KEY".to_string()],
+                    auth_style: "bearer".to_string(),
+                    delivery: ProviderCredentialDelivery::Proxy as i32,
+                    ..Default::default()
+                },
+            )])));
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            std::collections::HashMap::from([("API_KEY".to_string(), "real-secret".to_string())]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([(
+                "API_KEY".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider:API_KEY".to_string(),
+                    workload_credential_handle: String::new(),
+                    delivery: ProviderCredentialDelivery::Proxy as i32,
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("valid provider state");
+        let ctx = L7EvalContext {
+            host: "api.example.com".to_string(),
+            port: 443,
+            secret_resolver: state.resolver_for_endpoint("api.example.com", 443, "/v1/chat"),
+            provider_credentials: Some(state),
+            provider_credential_revision: Some(7),
+            dynamic_credentials: Some(dynamic_credentials),
+            ..Default::default()
+        };
+        let body = br#"{"messages":[{"content":"ordinary environment output"}]}"#;
+        let mut raw_header = b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell-managed\r\n\r\n".to_vec();
+        raw_header.extend_from_slice(body);
+        let request = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/chat".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header,
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+
+        let injected = inject_static_if_needed(request, &ctx).expect("credential injection");
+        let text = String::from_utf8(injected.raw_header).expect("HTTP request is UTF-8");
+        assert!(text.contains("Authorization: Bearer real-secret\r\n"));
+        assert!(!text.contains("openshell-managed"));
+        assert!(text.ends_with(std::str::from_utf8(body).expect("body is UTF-8")));
     }
 
     #[tokio::test]

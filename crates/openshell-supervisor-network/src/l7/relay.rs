@@ -66,7 +66,8 @@ pub struct L7EvalContext {
     pub(crate) provider_credential_revision: Option<u64>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
-    /// Dynamic credentials (token grants) keyed by endpoint-bound provider metadata.
+    /// Runtime-injected credentials (token grants and proxy-delivered static
+    /// credentials) keyed by endpoint-bound provider metadata.
     pub(crate) dynamic_credentials: Option<
         Arc<
             std::sync::RwLock<
@@ -1562,6 +1563,21 @@ where
                 };
             let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
             let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_static_if_needed(req_with_auth, ctx)
+                {
+                    Ok(req) => req,
+                    Err(error) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %error,
+                            "Static provider credential injection failed in L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
 
             // Forward request to upstream and relay response
             let outcome_result = relay_http_request_with_credential_rejection(
@@ -2810,6 +2826,20 @@ where
         };
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+        let req_with_auth =
+            match crate::l7::token_grant_injection::inject_static_if_needed(req_with_auth, ctx) {
+                Ok(req) => req,
+                Err(error) => {
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %error,
+                        "Static provider credential injection failed in passthrough relay"
+                    );
+                    write_bad_gateway_response(client).await?;
+                    return Ok(());
+                }
+            };
         let resolver = ctx.secret_resolver.as_deref();
 
         // Forward request with credential rewriting and relay the response.
@@ -2890,6 +2920,7 @@ mod tests {
             }],
             credential_identity: identity.to_string(),
             workload_credential_handle: String::new(),
+            delivery: 0,
         }
     }
 
@@ -4680,6 +4711,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -4784,6 +4816,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -5433,6 +5466,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -7893,6 +7927,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),

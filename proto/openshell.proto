@@ -1744,6 +1744,9 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Controls how a static credential reaches the workload. Unspecified and
+  // environment preserve the existing environment-placeholder behavior.
+  ProviderCredentialDelivery delivery = 11;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -2073,6 +2076,8 @@ message StaticCredentialBinding {
   // handle changes when the sandbox, provider, credential key, refresh
   // authorization epoch, or endpoint authorization boundary changes.
   string workload_credential_handle = 3;
+  // Delivery mode copied from the provider profile credential declaration.
+  ProviderCredentialDelivery delivery = 4;
 }
 
 // Get sandbox provider environment response.
@@ -2996,6 +3001,14 @@ enum ProviderCredentialRefreshRecoveryAction {
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE = 2;
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_FIX_CONFIGURATION = 3;
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
+}
+
+// Kept after the pre-existing enums so adding it does not renumber their
+// generated descriptors.
+enum ProviderCredentialDelivery {
+  PROVIDER_CREDENTIAL_DELIVERY_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_DELIVERY_ENVIRONMENT = 1;
+  PROVIDER_CREDENTIAL_DELIVERY_PROXY = 2;
 }
 
 // Workspace membership record.

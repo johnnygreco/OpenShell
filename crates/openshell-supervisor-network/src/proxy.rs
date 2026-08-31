@@ -4783,6 +4783,33 @@ async fn inject_token_grant_for_forward_request(
     forward_request_bytes: Vec<u8>,
     l7_ctx: &crate::l7::relay::L7EvalContext,
 ) -> Result<Vec<u8>> {
+    let request = forward_request_for_injection(method, upstream_target, forward_request_bytes)?;
+    crate::l7::token_grant_injection::inject_if_needed(request, l7_ctx)
+        .await
+        .map(|req| req.raw_header)
+}
+
+fn inject_static_credential_for_forward_request(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+    l7_ctx: &crate::l7::relay::L7EvalContext,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    revision: Option<u64>,
+) -> Result<Vec<u8>> {
+    let request = forward_request_for_injection(method, upstream_target, forward_request_bytes)?;
+    let mut scoped_ctx = l7_ctx.clone();
+    scoped_ctx.secret_resolver = secret_resolver;
+    scoped_ctx.provider_credential_revision = revision;
+    crate::l7::token_grant_injection::inject_static_if_needed(request, &scoped_ctx)
+        .map(|req| req.raw_header)
+}
+
+fn forward_request_for_injection(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+) -> Result<crate::l7::provider::L7Request> {
     let header_end = forward_request_bytes
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -4791,17 +4818,13 @@ async fn inject_token_grant_for_forward_request(
         .into_diagnostic()
         .map_err(|_| miette::miette!("Forward HTTP headers contain invalid UTF-8"))?;
     let body_length = crate::l7::rest::parse_body_length(header_str)?;
-    let forward_request_for_token_grant = crate::l7::provider::L7Request {
+    Ok(crate::l7::provider::L7Request {
         action: method.to_string(),
         target: upstream_target.to_string(),
         query_params: std::collections::HashMap::new(),
         raw_header: forward_request_bytes,
         body_length,
-    };
-
-    crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
-        .await
-        .map(|req| req.raw_header)
+    })
 }
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
@@ -5849,6 +5872,35 @@ async fn handle_forward_proxy(
     if let Some(guard) = credential_generation {
         guard.ensure_current()?;
     }
+    forward_request_bytes = match inject_static_credential_for_forward_request(
+        method,
+        &upstream_target,
+        forward_request_bytes,
+        &l7_ctx,
+        secret_resolver.clone(),
+        endpoint_credentials.revision,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %error,
+                "static provider credential injection failed in forward proxy"
+            );
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "provider_authentication_failed",
+                    "provider credential unavailable",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
@@ -7732,6 +7784,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -10511,6 +10564,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -10553,6 +10607,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -10599,6 +10654,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -11352,6 +11408,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
                 },
             )]),
             Vec::new(),
@@ -11441,6 +11498,7 @@ network_policies:
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
+                        delivery: 0,
                     },
                 )
             })

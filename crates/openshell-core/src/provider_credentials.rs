@@ -46,6 +46,7 @@ struct CompiledStaticCredentialBinding {
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
     workload_credential_handle: String,
+    delivery: crate::proto::ProviderCredentialDelivery,
 }
 
 #[derive(Debug, Clone)]
@@ -124,13 +125,14 @@ impl ProviderCredentialState {
             &non_secret_environment_keys,
         )?;
         let stable_handles = static_credential_stable_handles(&static_credential_bindings);
-        let (child_env, generation_resolver, current_resolver) =
+        let (mut child_env, generation_resolver, current_resolver) =
             SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
                 env,
                 credential_expires_at_ms,
                 revision,
                 &stable_handles,
             );
+        suppress_proxy_delivered_credentials(&mut child_env, &static_credential_bindings);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -532,6 +534,7 @@ impl ProviderCredentialState {
                 revision,
                 &stable_handles,
             );
+        suppress_proxy_delivered_credentials(&mut child_env, &static_credential_bindings);
         let mut inner = self
             .inner
             .write()
@@ -684,10 +687,23 @@ fn compile_static_credential_bindings(
                     endpoints,
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
+                    delivery: crate::proto::ProviderCredentialDelivery::try_from(binding.delivery)
+                        .unwrap_or(crate::proto::ProviderCredentialDelivery::Environment),
                 },
             ))
         })
         .collect()
+}
+
+fn suppress_proxy_delivered_credentials(
+    child_env: &mut HashMap<String, String>,
+    bindings: &HashMap<String, CompiledStaticCredentialBinding>,
+) {
+    for (key, binding) in bindings {
+        if binding.delivery == crate::proto::ProviderCredentialDelivery::Proxy {
+            child_env.remove(key);
+        }
+    }
 }
 
 fn compile_static_credential_endpoint(
@@ -808,6 +824,7 @@ mod tests {
             }],
             credential_identity: "provider-a:API_KEY".to_string(),
             workload_credential_handle: String::new(),
+            delivery: 0,
         }
     }
 
@@ -940,6 +957,32 @@ mod tests {
                 .expect_err("endpoint mismatch must fail closed");
             assert!(error.is_endpoint_mismatch(), "{host}:{port}{path}");
         }
+    }
+
+    #[test]
+    fn proxy_delivered_credential_is_not_in_child_environment() {
+        let mut proxy_binding = binding("api.example.com", 443, "/v1/**");
+        proxy_binding.delivery = crate::proto::ProviderCredentialDelivery::Proxy as i32;
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), proxy_binding)]),
+            Vec::new(),
+        )
+        .expect("valid proxy delivery binding");
+
+        assert!(!state.snapshot().child_env.contains_key("API_KEY"));
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+            .expect("endpoint resolver");
+        assert_eq!(
+            resolver
+                .resolve_current_env_key_checked("API_KEY", "test")
+                .expect("authorized endpoint"),
+            Some("secret")
+        );
     }
 
     #[test]
