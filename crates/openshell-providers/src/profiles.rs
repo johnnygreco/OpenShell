@@ -7,7 +7,7 @@
 
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
+    NetworkEndpoint, NetworkPolicyRule, ProviderCredentialDelivery, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
@@ -98,6 +98,13 @@ pub struct CredentialProfile {
     pub env_vars: Vec<String>,
     #[serde(default)]
     pub required: bool,
+    #[serde(
+        default = "default_credential_delivery",
+        deserialize_with = "deserialize_credential_delivery",
+        serialize_with = "serialize_credential_delivery",
+        skip_serializing_if = "is_environment_delivery"
+    )]
+    pub delivery: ProviderCredentialDelivery,
     #[serde(default)]
     pub auth_style: String,
     #[serde(default)]
@@ -453,6 +460,10 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    delivery: effective_credential_delivery(
+                        ProviderCredentialDelivery::try_from(credential.delivery)
+                            .unwrap_or(ProviderCredentialDelivery::Unspecified),
+                    ),
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -596,6 +607,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    delivery: credential.delivery as i32,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -863,6 +875,24 @@ fn default_token_grant_type() -> ProviderCredentialTokenGrantType {
     ProviderCredentialTokenGrantType::ClientCredentials
 }
 
+fn default_credential_delivery() -> ProviderCredentialDelivery {
+    ProviderCredentialDelivery::Environment
+}
+
+fn effective_credential_delivery(
+    delivery: ProviderCredentialDelivery,
+) -> ProviderCredentialDelivery {
+    match delivery {
+        ProviderCredentialDelivery::Unspecified => ProviderCredentialDelivery::Environment,
+        other => other,
+    }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_environment_delivery(value: &ProviderCredentialDelivery) -> bool {
+    effective_credential_delivery(*value) == ProviderCredentialDelivery::Environment
+}
+
 fn effective_token_grant_type(
     grant_type: ProviderCredentialTokenGrantType,
 ) -> ProviderCredentialTokenGrantType {
@@ -932,6 +962,29 @@ where
         .ok_or_else(|| de::Error::custom(format!("unsupported provider token grant type: {raw}")))
 }
 
+fn deserialize_credential_delivery<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialDelivery, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_credential_delivery_from_yaml(&raw).ok_or_else(|| {
+        de::Error::custom(format!("unsupported provider credential delivery: {raw}"))
+    })
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_credential_delivery<S>(
+    delivery: &ProviderCredentialDelivery,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(provider_credential_delivery_to_yaml(*delivery))
+}
+
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn serialize_token_grant_type<S>(
     grant_type: &ProviderCredentialTokenGrantType,
@@ -985,6 +1038,25 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         }
         "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_credential_delivery_from_yaml(raw: &str) -> Option<ProviderCredentialDelivery> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" | "environment" => Some(ProviderCredentialDelivery::Environment),
+        "proxy" => Some(ProviderCredentialDelivery::Proxy),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_credential_delivery_to_yaml(delivery: ProviderCredentialDelivery) -> &'static str {
+    match delivery {
+        ProviderCredentialDelivery::Proxy => "proxy",
+        ProviderCredentialDelivery::Environment | ProviderCredentialDelivery::Unspecified => {
+            "environment"
+        }
     }
 }
 
@@ -1693,6 +1765,7 @@ pub fn validate_profile_set(
         ));
 
         let mut env_vars = HashSet::new();
+        let mut proxy_delivery_credentials = 0;
         for credential in &profile.credentials {
             for env_var in &credential.env_vars {
                 if env_var.trim().is_empty() {
@@ -1724,6 +1797,9 @@ pub fn validate_profile_set(
             let auth_style = credential.auth_style.trim().to_ascii_lowercase();
             match auth_style.as_str() {
                 "" | "basic" => {}
+                "bearer"
+                    if effective_credential_delivery(credential.delivery)
+                        == ProviderCredentialDelivery::Proxy => {}
                 "bearer" | "header" => {
                     if credential.header_name.trim().is_empty() {
                         diagnostics.push(ProfileValidationDiagnostic::error(
@@ -1775,6 +1851,71 @@ pub fn validate_profile_set(
                     "credentials.auth_style",
                     format!("unsupported auth_style: {}", credential.auth_style),
                 )),
+            }
+
+            if effective_credential_delivery(credential.delivery)
+                == ProviderCredentialDelivery::Proxy
+            {
+                proxy_delivery_credentials += 1;
+                if credential.env_vars.is_empty() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.env_vars",
+                        "proxy-delivered credentials must declare at least one env var",
+                    ));
+                }
+                if profile.endpoints.is_empty() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.delivery",
+                        "proxy-delivered credentials require a profile endpoint",
+                    ));
+                }
+                if credential.token_grant.is_some() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.delivery",
+                        "proxy delivery is only valid for static credentials",
+                    ));
+                }
+                if !matches!(auth_style.as_str(), "bearer" | "header") {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.auth_style",
+                        "proxy-delivered credentials support auth_style bearer or header",
+                    ));
+                } else if let Err(message) = validate_proxy_delivery_header_name(credential) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.header_name",
+                        message,
+                    ));
+                }
+
+                for (index, endpoint) in profile.endpoints.iter().enumerate() {
+                    let protocol = endpoint.protocol.trim().to_ascii_lowercase();
+                    if protocol != "rest" {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            format!("endpoints[{index}].protocol"),
+                            "proxy-delivered credentials require protocol: rest",
+                        ));
+                    }
+                    if endpoint.tls.trim().eq_ignore_ascii_case("skip") {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            format!("endpoints[{index}].tls"),
+                            "proxy-delivered credentials do not support tls: skip",
+                        ));
+                    }
+                }
             }
 
             if let Some(refresh) = credential.refresh.as_ref() {
@@ -1995,6 +2136,28 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+        }
+
+        if proxy_delivery_credentials > 1 {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "credentials.delivery",
+                "provider profiles support only one proxy-delivered credential",
+            ));
+        }
+        if proxy_delivery_credentials > 0
+            && profile
+                .credentials
+                .iter()
+                .any(|credential| credential.token_grant.is_some())
+        {
+            diagnostics.push(ProfileValidationDiagnostic::error(
+                source,
+                profile_id,
+                "credentials.delivery",
+                "provider profiles cannot combine proxy-delivered credentials with token grants",
+            ));
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
@@ -2821,13 +2984,24 @@ fn validate_token_grant_auth_style(credential: &CredentialProfile) -> Result<(),
 }
 
 fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<(), String> {
+    validate_injected_header_name(credential, "token_grant")
+}
+
+fn validate_proxy_delivery_header_name(credential: &CredentialProfile) -> Result<(), String> {
+    validate_injected_header_name(credential, "proxy delivery")
+}
+
+fn validate_injected_header_name(
+    credential: &CredentialProfile,
+    context: &str,
+) -> Result<(), String> {
     let header_name = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" if credential.header_name.trim().is_empty() => "Authorization",
         "" | "bearer" | "header" => credential.header_name.trim(),
         _ => return Ok(()),
     };
     if header_name.is_empty() {
-        return Ok(());
+        return Err(format!("{context} auth_style header requires header_name"));
     }
     let valid = header_name.bytes().all(|byte| {
         byte.is_ascii_alphanumeric()
@@ -2850,13 +3024,14 @@ fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<()
             )
     });
     if !valid {
-        return Err("token_grant header_name is not a valid HTTP header name".to_string());
+        return Err(format!(
+            "{context} header_name is not a valid HTTP header name"
+        ));
     }
     match header_name.to_ascii_lowercase().as_str() {
-        "host" | "content-length" | "transfer-encoding" | "connection" => Err(
-            "token_grant header_name may not override HTTP framing or connection headers"
-                .to_string(),
-        ),
+        "host" | "content-length" | "transfer-encoding" | "connection" => Err(format!(
+            "{context} header_name may not override HTTP framing or connection headers"
+        )),
         _ => Ok(()),
     }
 }
@@ -2911,7 +3086,9 @@ pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
 mod tests {
     use std::collections::HashMap;
 
-    use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
+    use openshell_core::proto::{
+        ProviderCredentialDelivery, ProviderCredentialTokenGrantType, ProviderProfileCategory,
+    };
 
     use super::{
         DiscoveryProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileError, ProviderTypeProfile,
@@ -3432,6 +3609,112 @@ credentials:
             reparsed.credentials[3].path_template,
             "/v1/{credential}/resources"
         );
+    }
+
+    #[test]
+    fn proxy_credential_delivery_round_trips_and_environment_remains_default() {
+        let profile = parse_profile_yaml(
+            r"
+id: proxy-auth
+display_name: Proxy Auth
+credentials:
+  - name: environment_key
+    env_vars: [ENVIRONMENT_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+  - name: proxy_header
+    env_vars: [PROXY_HEADER_KEY, PROXY_HEADER_KEY_FALLBACK]
+    delivery: proxy
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("proxy-auth.yaml".to_string(), profile.clone())]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(
+            profile.credentials[1].delivery,
+            ProviderCredentialDelivery::Proxy
+        );
+        assert_eq!(profile.credentials[1].env_vars.len(), 2);
+        assert_eq!(
+            profile.credentials[0].delivery,
+            ProviderCredentialDelivery::Environment
+        );
+
+        let exported = profile_to_yaml(&ProviderTypeProfile::from_proto(&profile.to_proto()))
+            .expect("serialize YAML");
+        assert!(exported.contains("delivery: proxy"));
+        assert_eq!(exported.matches("delivery: proxy").count(), 1);
+    }
+
+    #[test]
+    fn proxy_delivery_requires_an_env_var_and_one_credential_per_profile() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-proxy-auth
+display_name: Invalid Proxy Auth
+credentials:
+  - name: missing_env
+    delivery: proxy
+    auth_style: bearer
+  - name: second_proxy
+    env_vars: [SECOND_KEY]
+    delivery: proxy
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("invalid.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message
+            == "proxy-delivered credentials must declare at least one env var"));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message
+            == "provider profiles support only one proxy-delivered credential"));
+    }
+
+    #[test]
+    fn proxy_delivery_cannot_share_a_profile_with_token_grants() {
+        let profile = parse_profile_yaml(
+            r"
+id: mixed-runtime-auth
+display_name: Mixed Runtime Auth
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: bearer
+  - name: access_token
+    auth_style: bearer
+    token_grant:
+      token_endpoint: https://login.example.com/oauth2/token
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("mixed.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.message
+            == "provider profiles cannot combine proxy-delivered credentials with token grants"));
     }
 
     #[test]
