@@ -225,30 +225,33 @@ fn bridge_result(
 ) -> Result<BridgeResponse, &'static str> {
     match Decision::try_from(result.decision).unwrap_or(Decision::Unspecified) {
         Decision::Allow => {
-            if result.attestation.is_empty() {
-                return Err("missing_admission_attestation");
-            }
-            let port =
-                u16::try_from(selection.provider_port).map_err(|_| "invalid_provider_port")?;
-            let handle = runner
-                .issue_agent_admission_handle(
-                    openshell_supervisor_middleware::AgentAdmissionGrantInput {
-                        sandbox_id,
-                        middleware_name: &selection.middleware_name,
-                        scheme: &selection.provider_scheme,
-                        host: &selection.provider_host,
-                        port,
-                        policy_generation,
-                        attestation: result.attestation,
-                    },
+            let handle = if result.attestation.is_empty() {
+                None
+            } else {
+                let port =
+                    u16::try_from(selection.provider_port).map_err(|_| "invalid_provider_port")?;
+                Some(
+                    runner
+                        .issue_agent_admission_handle(
+                            openshell_supervisor_middleware::AgentAdmissionGrantInput {
+                                sandbox_id,
+                                middleware_name: &selection.middleware_name,
+                                scheme: &selection.provider_scheme,
+                                host: &selection.provider_host,
+                                port,
+                                policy_generation,
+                                attestation: result.attestation,
+                            },
+                        )
+                        .map_err(|_| "admission_store_unavailable")?,
                 )
-                .map_err(|_| "admission_store_unavailable")?;
+            };
             Ok(BridgeResponse {
                 decision: "allow",
                 replacement_body: result
                     .has_replacement_body
                     .then_some(result.replacement_body),
-                handle: Some(handle),
+                handle,
                 reason_code: None,
                 metadata: (!result.metadata.is_empty()).then_some(result.metadata),
             })
@@ -440,5 +443,23 @@ mod tests {
         assert_eq!(deny.reason_code.as_deref(), Some("policy_denied"));
         assert_eq!(deny.handle, None);
         assert_eq!(deny.replacement_body, None);
+    }
+
+    #[test]
+    fn result_mapping_allows_without_an_attestation_handle() {
+        let response = bridge_result(
+            &openshell_supervisor_middleware::ChainRunner::default(),
+            "sandbox-1",
+            7,
+            &selection(1024),
+            AgentConversationResult {
+                decision: Decision::Allow as i32,
+                ..Default::default()
+            },
+        )
+        .expect("allow without attestation");
+
+        assert_eq!(response.decision, "allow");
+        assert_eq!(response.handle, None);
     }
 }
