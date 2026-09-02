@@ -247,7 +247,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
 - The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`, and `AGENT_CONVERSATION/AGENT_CONTEXT`.
-- The initial agent bridge supports exactly one configured agent-conversation binding, one exact provider host, and combined sandbox topology. Adding the first agent binding to a running sandbox requires recreating that sandbox so the loopback listener and environment variable are present.
+- The initial agent bridge selects one configured agent-conversation middleware and one exact provider host. That middleware may advertise multiple hook and schema bindings. Adding the first agent binding to a running sandbox requires recreating that sandbox so the loopback listener and environment variable are present.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
 - Selection uses destination host include and exclude patterns.

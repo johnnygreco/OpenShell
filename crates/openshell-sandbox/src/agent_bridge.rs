@@ -90,8 +90,6 @@ struct BridgeResponse {
     handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,7 +274,6 @@ fn bridge_result(
                     .then_some(result.replacement_body),
                 handle,
                 reason_code: None,
-                metadata: (!result.metadata.is_empty()).then_some(result.metadata),
             })
         }
         Decision::Deny => Ok(BridgeResponse {
@@ -284,7 +281,6 @@ fn bridge_result(
             replacement_body: None,
             handle: None,
             reason_code: (!result.reason_code.is_empty()).then_some(result.reason_code),
-            metadata: None,
         }),
         Decision::Unspecified => Err("invalid_admission_response"),
     }
@@ -453,15 +449,15 @@ mod tests {
                 attestation: b"receipt".to_vec(),
                 replacement_body: b"redacted".to_vec(),
                 has_replacement_body: true,
+                metadata: std::collections::HashMap::from([("internal".into(), "value".into())]),
                 ..Default::default()
             },
         )
         .expect("allow");
         assert_eq!(allow.decision, "allow");
-        assert_eq!(
-            serde_json::to_value(&allow).unwrap()["replacement_body_b64"],
-            "cmVkYWN0ZWQ="
-        );
+        let response_json = serde_json::to_value(&allow).unwrap();
+        assert_eq!(response_json["replacement_body_b64"], "cmVkYWN0ZWQ=");
+        assert!(response_json.get("metadata").is_none());
         let handle = allow.handle.expect("handle");
         assert_ne!(handle.as_bytes(), b"receipt");
         let request = openshell_supervisor_middleware::AgentAdmissionRequest {
