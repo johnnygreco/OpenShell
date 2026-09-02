@@ -11,12 +11,13 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
-    MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
-    ValidateConfigRequest, ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult,
-    WebSocketPreflightAction, WebSocketPreflightDecision, WebSocketSessionEvent,
-    WebSocketSessionEventResult, web_socket_message, web_socket_message_result,
-    web_socket_session_event, web_socket_session_event_result,
+    AgentConversationEvaluation, AgentConversationResult, Decision, Finding,
+    HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding, MiddlewareManifest,
+    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
+    ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult, WebSocketPreflightAction,
+    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
+    web_socket_message, web_socket_message_result, web_socket_session_event,
+    web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -231,12 +232,14 @@ impl SupervisorMiddleware for ContentGuard {
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
                     timeout: String::new(),
+                    ..Default::default()
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
                     timeout: String::new(),
+                    ..Default::default()
                 },
             ],
             expected_audience: String::new(),
@@ -272,6 +275,15 @@ impl SupervisorMiddleware for ContentGuard {
         let body = String::from_utf8(request.body)
             .map_err(|_| Status::invalid_argument("content guard requires a UTF-8 body"))?;
         Ok(Response::new(evaluate(&config, &body)))
+    }
+
+    async fn evaluate_agent_conversation(
+        &self,
+        _request: Request<AgentConversationEvaluation>,
+    ) -> Result<Response<AgentConversationResult>, Status> {
+        Err(Status::unimplemented(
+            "content guard does not implement agent admission",
+        ))
     }
 
     async fn evaluate_web_socket_session(

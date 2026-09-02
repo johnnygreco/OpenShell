@@ -181,6 +181,20 @@ middleware registry validates implementation-owned config. The generic
 registry and chain runner live in `openshell-supervisor-middleware`; first-party
 implementations live in `openshell-supervisor-middleware-builtins`.
 
+Managed agent admission reuses the operator middleware registry without joining
+the HTTP chain. When one configured operator middleware advertises exact
+`AGENT_CONVERSATION/AGENT_CONTEXT` hook and schema bindings, the sandbox
+supervisor binds a loopback-only bridge inside the workload network namespace.
+The bridge stamps sandbox and provider identity, retains an allowed response's
+attestation, and returns a bounded opaque handle with the decision and optional
+replacement. Provider egress strips and resolves that handle, exposing the
+attestation only to the matching middleware stage. Handles are scoped to the
+sandbox, middleware, provider target, and runtime generation and remain
+retryable only for their bounded lifetime, so partial policy or registry reloads
+cannot mix admission and egress state. An allowed admission result without an
+attestation returns no handle; append-time checks need only a decision, while an
+attested provider-context check supplies the handle used at provider egress.
+
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.
 Policy-only updates reuse the connected registry, so an external middleware
@@ -393,6 +407,23 @@ tokens are cached separately by provider resource version, supervisor SPIFFE
 subject, and gateway SPIFFE subject, and their cache lifetime is capped by the
 intermediate token response, stored subject-token expiry, and supervisor SVID
 expiry.
+
+Static credentials may instead opt into proxy delivery (`delivery: proxy` on a
+`bearer` or named `header` profile credential). The gateway marks the static
+credential binding with the delivery mode and placement metadata, and the
+supervisor removes the key from the child environment so the workload holds
+neither the secret nor a placeholder. For an inspected REST request whose
+endpoint matches a proxy-delivered binding, the proxy resolves the value through
+the same request-scoped resolver used for placeholders and replaces the complete
+header immediately before the upstream write, after network policy, L7 rules,
+and middleware have admitted the request. The binding is the only source of
+truth: the proxy does not consult profile metadata at request time. Aliases of
+one credential collapse into a single header; distinct matching credentials fail
+closed because the gateway already rejects that configuration. Injection
+requires an inspected REST endpoint without `tls: skip`, so uninspected traffic
+forwards whatever header the application sent. Success and failure both emit an
+OCSF HTTP activity event naming the environment key and endpoint but never the
+value.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy

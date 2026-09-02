@@ -4783,6 +4783,33 @@ async fn inject_token_grant_for_forward_request(
     forward_request_bytes: Vec<u8>,
     l7_ctx: &crate::l7::relay::L7EvalContext,
 ) -> Result<Vec<u8>> {
+    let request = forward_request_for_injection(method, upstream_target, forward_request_bytes)?;
+    crate::l7::token_grant_injection::inject_if_needed(request, l7_ctx)
+        .await
+        .map(|req| req.raw_header)
+}
+
+fn inject_static_credential_for_forward_request(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+    l7_ctx: &crate::l7::relay::L7EvalContext,
+    secret_resolver: Option<Arc<SecretResolver>>,
+    revision: Option<u64>,
+) -> Result<Vec<u8>> {
+    let request = forward_request_for_injection(method, upstream_target, forward_request_bytes)?;
+    let mut scoped_ctx = l7_ctx.clone();
+    scoped_ctx.secret_resolver = secret_resolver;
+    scoped_ctx.provider_credential_revision = revision;
+    crate::l7::token_grant_injection::inject_static_if_needed(request, &scoped_ctx)
+        .map(|req| req.raw_header)
+}
+
+fn forward_request_for_injection(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+) -> Result<crate::l7::provider::L7Request> {
     let header_end = forward_request_bytes
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -4791,17 +4818,13 @@ async fn inject_token_grant_for_forward_request(
         .into_diagnostic()
         .map_err(|_| miette::miette!("Forward HTTP headers contain invalid UTF-8"))?;
     let body_length = crate::l7::rest::parse_body_length(header_str)?;
-    let forward_request_for_token_grant = crate::l7::provider::L7Request {
+    Ok(crate::l7::provider::L7Request {
         action: method.to_string(),
         target: upstream_target.to_string(),
         query_params: std::collections::HashMap::new(),
         raw_header: forward_request_bytes,
         body_length,
-    };
-
-    crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
-        .await
-        .map(|req| req.raw_header)
+    })
 }
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
@@ -5849,6 +5872,40 @@ async fn handle_forward_proxy(
     if let Some(guard) = credential_generation {
         guard.ensure_current()?;
     }
+    forward_request_bytes = match inject_static_credential_for_forward_request(
+        method,
+        &upstream_target,
+        forward_request_bytes,
+        &l7_ctx,
+        secret_resolver.clone(),
+        endpoint_credentials.revision,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %error,
+                "static provider credential injection failed in forward proxy"
+            );
+            if let Some(session) = middleware_session.take() {
+                session
+                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .await;
+            }
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "provider_authentication_failed",
+                    "provider credential unavailable",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
@@ -6378,6 +6435,7 @@ mod tests {
                             as i32,
                         max_payload_bytes: 1024,
                         timeout: "1s".into(),
+                        ..Default::default()
                     }],
                     expected_audience: String::new(),
                 },
@@ -6404,6 +6462,16 @@ mod tests {
             _request: tonic::Request<openshell_core::proto::HttpRequestEvaluation>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("WebSocket-only test service"))
+        }
+
+        async fn evaluate_agent_conversation(
+            &self,
+            _request: tonic::Request<openshell_core::proto::AgentConversationEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::AgentConversationResult>,
             tonic::Status,
         > {
             Err(tonic::Status::unimplemented("WebSocket-only test service"))
@@ -6462,6 +6530,7 @@ mod tests {
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
                     timeout: String::new(),
+                    ..Default::default()
                 }],
                 expected_audience: String::new(),
             }
@@ -7732,6 +7801,9 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),
@@ -10511,6 +10583,9 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),
@@ -10553,6 +10628,9 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),
@@ -10599,6 +10677,9 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),
@@ -10889,6 +10970,340 @@ network_policies:
     }
 
     // --- rewrite_forward_request tests ---
+
+    /// Bound provider state with one proxy-delivered credential at
+    /// `{host}:{port}/v1/**`.
+    fn forward_proxy_delivered_state(
+        host: &str,
+        port: u16,
+        auth_style: &str,
+        header_name: &str,
+        value: &str,
+    ) -> ProviderCredentialState {
+        use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+        ProviderCredentialState::from_bound_environment(
+            3,
+            TestHashMap::from([("API_TOKEN".to_string(), value.to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: host.to_string(),
+                        port: u32::from(port),
+                        path: "/v1/**".to_string(),
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
+                    delivery: openshell_core::proto::ProviderCredentialDelivery::Proxy as i32,
+                    auth_style: auth_style.to_string(),
+                    header_name: header_name.to_string(),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state")
+    }
+
+    #[test]
+    fn forward_proxy_injects_proxy_delivered_credential_before_rewriting_request() {
+        let state = forward_proxy_delivered_state(
+            "api.example.test",
+            8080,
+            "header",
+            "x-api-key",
+            "key with spaces",
+        );
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            provider_credentials: Some(state.clone()),
+            secret_resolver: state.resolver(),
+            ..Default::default()
+        };
+        // Mirror the production sequence: acquire the endpoint-scoped resolver
+        // after admission, then inject from the live provider state.
+        let credentials = endpoint_credentials_for_request(
+            ctx.provider_credentials.as_ref(),
+            ctx.secret_resolver.clone(),
+            &ctx.host,
+            ctx.port,
+            "/v1/projects",
+        );
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nx-api-key: public-value\r\nConnection: close\r\n\r\n".to_vec();
+
+        let injected = inject_static_credential_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw,
+            &ctx,
+            credentials.resolver,
+            credentials.revision,
+        )
+        .expect("proxy-delivered credential should inject");
+        let rewritten = rewrite_forward_request(
+            &injected,
+            injected.len(),
+            "/v1/projects",
+            "api.example.test:8080",
+            None,
+            false,
+        )
+        .expect("forward request should rewrite");
+        let rewritten = String::from_utf8_lossy(&rewritten);
+
+        assert!(rewritten.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(
+            rewritten.contains("x-api-key: key with spaces\r\n"),
+            "{rewritten}"
+        );
+        assert!(!rewritten.contains("public-value"), "{rewritten}");
+        assert_eq!(
+            rewritten.to_ascii_lowercase().matches("x-api-key:").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn forward_proxy_proxy_delivered_credential_failure_stops_before_rewrite() {
+        // A live binding with no request-scoped resolver must fail closed
+        // instead of forwarding the workload's placeholder header upstream.
+        let state =
+            forward_proxy_delivered_state("api.example.test", 8080, "bearer", "", "real-secret");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            request_default_port: Some(8080),
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            provider_credentials: Some(state.clone()),
+            secret_resolver: state.resolver(),
+            ..Default::default()
+        };
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer public-value\r\nConnection: close\r\n\r\n".to_vec();
+
+        let err = inject_static_credential_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw.clone(),
+            &ctx,
+            None,
+            Some(3),
+        )
+        .expect_err("proxy-delivered credential without a resolver must not inject");
+        assert!(err.to_string().contains("resolver unavailable"), "{err}");
+        assert!(!err.to_string().contains("real-secret"));
+
+        // Revocation clears the live bindings. A request scoped after
+        // revocation has nothing to inject and is left for the placeholder
+        // rewriter, which has nothing to rewrite either.
+        state.revoke_static_provider_environment(4);
+        let credentials = endpoint_credentials_for_request(
+            ctx.provider_credentials.as_ref(),
+            ctx.secret_resolver.clone(),
+            &ctx.host,
+            ctx.port,
+            "/v1/projects",
+        );
+        assert!(credentials.resolver.is_none());
+        let untouched = inject_static_credential_for_forward_request(
+            "GET",
+            "/v1/projects",
+            raw.clone(),
+            &ctx,
+            credentials.resolver,
+            credentials.revision,
+        )
+        .expect("revoked bindings leave the request untouched");
+        assert_eq!(untouched, raw);
+
+        // Requests outside the binding are left untouched as well.
+        let state =
+            forward_proxy_delivered_state("api.example.test", 8080, "bearer", "", "real-secret");
+        let ctx = crate::l7::relay::L7EvalContext {
+            provider_credentials: Some(state.clone()),
+            secret_resolver: state.resolver(),
+            ..ctx
+        };
+        let raw = b"GET http://api.example.test:8080/v2/other HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer public-value\r\nConnection: close\r\n\r\n".to_vec();
+        let credentials = endpoint_credentials_for_request(
+            ctx.provider_credentials.as_ref(),
+            ctx.secret_resolver.clone(),
+            &ctx.host,
+            ctx.port,
+            "/v2/other",
+        );
+        let untouched = inject_static_credential_for_forward_request(
+            "GET",
+            "/v2/other",
+            raw.clone(),
+            &ctx,
+            credentials.resolver,
+            credentials.revision,
+        )
+        .expect("unbound path passes through");
+        assert_eq!(untouched, raw);
+    }
+
+    #[tokio::test]
+    async fn plaintext_forward_proxy_delivers_proxy_credential_end_to_end() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        let upstream_listener = TcpListener::bind((upstream_ip, 0))
+            .await
+            .expect("bind upstream listener");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let executable = std::env::current_exe().expect("current executable");
+        let data = format!(
+            r#"
+network_policies:
+  allow-upstream:
+    name: allow-upstream
+    endpoints:
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        protocol: rest
+        access: full
+    binaries:
+      - {{ path: "{executable}" }}
+"#,
+            executable = executable.display(),
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), &data)
+                .expect("load policy"),
+        );
+        let state = forward_proxy_delivered_state(
+            &upstream_ip.to_string(),
+            upstream_port,
+            "bearer",
+            "",
+            "real-secret",
+        );
+        assert!(
+            !state.snapshot().child_env.contains_key("API_TOKEN"),
+            "proxy delivery must not expose a placeholder"
+        );
+
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.expect("accept upstream");
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("read upstream request");
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..read]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("write upstream response");
+            let _ = socket.shutdown().await;
+            received
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy listener");
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = format!("http://{upstream_ip}:{upstream_port}/v1/projects");
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {upstream_ip}:{upstream_port}\r\nAuthorization: Bearer public-value\r\nConnection: close\r\n\r\n"
+        );
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(proxy_address)
+                .await
+                .expect("connect proxy");
+            socket
+                .write_all(request.as_bytes())
+                .await
+                .expect("write proxy request");
+            let mut response = Vec::new();
+            socket
+                .read_to_end(&mut response)
+                .await
+                .expect("read proxy response");
+            response
+        });
+        let (mut proxy_connection, _) = proxy_listener.accept().await.unwrap();
+        let mut buf = vec![0_u8; 8192];
+        let used = proxy_connection
+            .read(&mut buf)
+            .await
+            .expect("read forward request");
+        let head = String::from_utf8_lossy(&buf[..used]).into_owned();
+        let mut parts = head.split_whitespace();
+        let method = parts.next().expect("method").to_string();
+        let target_uri = parts.next().expect("target").to_string();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            handle_forward_proxy(
+                &method,
+                &target_uri,
+                &buf,
+                used,
+                &mut proxy_connection,
+                engine,
+                Arc::new(BinaryIdentityCache::new()),
+                Arc::new(AtomicU32::new(std::process::id())),
+                None,
+                AgentProposals::default(),
+                Arc::new(None),
+                Some(state.clone()),
+                state.resolver(),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("forward proxy must complete")
+        .expect("handle plaintext forward request");
+        drop(proxy_connection);
+
+        let response = String::from_utf8(client.await.unwrap()).expect("UTF-8 response");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "upstream response must be relayed: {response}"
+        );
+        let forwarded = String::from_utf8(
+            tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
+                .await
+                .expect("upstream must receive the request")
+                .unwrap(),
+        )
+        .expect("UTF-8 upstream request");
+        assert!(
+            forwarded.contains("Authorization: Bearer real-secret\r\n"),
+            "forward proxy must inject the proxy-delivered credential: {forwarded}"
+        );
+        assert!(!forwarded.contains("public-value"), "{forwarded}");
+        assert_eq!(
+            forwarded.matches("Authorization:").count(),
+            1,
+            "{forwarded}"
+        );
+    }
 
     #[tokio::test]
     async fn forward_proxy_injects_token_grant_before_rewriting_request() {
@@ -11352,6 +11767,9 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),
@@ -11441,6 +11859,9 @@ network_policies:
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
+                        delivery: 0,
+                        auth_style: String::new(),
+                        header_name: String::new(),
                     },
                 )
             })

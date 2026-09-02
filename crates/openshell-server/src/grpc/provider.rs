@@ -16,7 +16,7 @@ use crate::provider_profile_sources::{
 };
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
-    CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
+    CredentialHandle, Provider, ProviderCredentialDelivery, ProviderCredentialRefreshStrategy,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
     ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
     StaticCredentialEndpointBinding, StoredProviderCredentialRefreshState,
@@ -64,6 +64,8 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
 pub(super) struct ProviderEnvironment {
     pub environment: HashMap<String, String>,
     pub credential_expires_at_ms: HashMap<String, i64>,
+    /// Endpoint metadata for dynamic token grants. Proxy-delivered static
+    /// credentials travel in `static_credential_bindings` instead.
     pub dynamic_credentials: HashMap<String, ProviderProfileCredential>,
     pub static_credential_bindings: HashMap<String, StaticCredentialBinding>,
     pub static_credential_keys: HashSet<String>,
@@ -1286,6 +1288,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             key,
                             endpoints,
                             refresh_epochs.get(key).map(String::as_str),
+                            profile_credential_for_key(profile_proto.as_ref(), key),
                         ),
                     );
                 }
@@ -1356,6 +1359,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             &key,
                             endpoints,
                             refresh_epochs.get(&key).map(String::as_str),
+                            profile_credential_for_key(profile_proto.as_ref(), &key),
                         ),
                     );
                 }
@@ -1426,6 +1430,7 @@ fn static_credential_binding(
     key: &str,
     endpoints: &[StaticCredentialEndpointBinding],
     authorization_epoch: Option<&str>,
+    profile_credential: Option<&ProviderProfileCredential>,
 ) -> StaticCredentialBinding {
     let workload_credential_handle = sandbox_id
         .zip(authorization_epoch)
@@ -1438,11 +1443,42 @@ fn static_credential_binding(
     } else {
         format!("refresh:{workload_credential_handle}")
     };
+    // The binding is the sandbox's only source of truth for proxy delivery, so
+    // it carries the placement metadata the proxy needs to build the header.
+    // Environment-delivered credentials keep the wire fields empty.
+    let proxy_credential = profile_credential.filter(|credential| {
+        ProviderCredentialDelivery::try_from(credential.delivery).unwrap_or_default()
+            == ProviderCredentialDelivery::Proxy
+    });
+    let delivery = if proxy_credential.is_some() {
+        ProviderCredentialDelivery::Proxy
+    } else {
+        ProviderCredentialDelivery::Environment
+    };
     StaticCredentialBinding {
         endpoints: endpoints.to_vec(),
         credential_identity,
         workload_credential_handle,
+        delivery: delivery as i32,
+        auth_style: proxy_credential
+            .map(|credential| credential.auth_style.trim().to_ascii_lowercase())
+            .unwrap_or_default(),
+        header_name: proxy_credential
+            .map(|credential| credential.header_name.trim().to_string())
+            .unwrap_or_default(),
     }
+}
+
+fn profile_credential_for_key<'a>(
+    profile: Option<&'a ProviderProfile>,
+    key: &str,
+) -> Option<&'a ProviderProfileCredential> {
+    profile.and_then(|profile| {
+        profile
+            .credentials
+            .iter()
+            .find(|credential| credential.env_vars.iter().any(|env_var| env_var == key))
+    })
 }
 
 fn derive_workload_credential_handle(
@@ -1682,7 +1718,7 @@ fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
     }
 }
 
-fn dynamic_token_grant_match_score(host: &str, path: &str) -> u32 {
+fn runtime_credential_match_score(host: &str, path: &str) -> u32 {
     host_pattern_specificity(host) + endpoint_path_specificity(path)
 }
 
@@ -1887,7 +1923,7 @@ async fn validate_provider_environment_keys_unique_at(
 ) -> Result<(), Status> {
     let mut seen_credentials = HashMap::<String, String>::new();
     let mut seen_plugin_config = HashMap::<String, String>::new();
-    let mut dynamic_bindings = Vec::new();
+    let mut runtime_bindings = Vec::new();
     for name in provider_names {
         let provider = match candidate_provider {
             Some(candidate) if candidate.object_name() == name.as_str() => candidate.clone(),
@@ -1907,11 +1943,11 @@ async fn validate_provider_environment_keys_unique_at(
             active_provider_environment_keys(store, catalog, &provider, now_ms).await?,
             provider_plugin_environment_keys(catalog, &provider),
         )?;
-        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+        runtime_bindings.extend(runtime_credential_bindings_for_provider_with_catalog(
             catalog, &provider,
         ));
     }
-    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    validate_runtime_credential_bindings_unambiguous(&runtime_bindings)?;
     Ok(())
 }
 
@@ -1923,7 +1959,7 @@ async fn validate_provider_environment_records_unique_at(
 ) -> Result<(), Status> {
     let mut seen_credentials = HashMap::<String, String>::new();
     let mut seen_plugin_config = HashMap::<String, String>::new();
-    let mut dynamic_bindings = Vec::new();
+    let mut runtime_bindings = Vec::new();
     for record in records {
         let provider = &record.provider;
         validate_provider_environment_key_ownership(
@@ -1940,11 +1976,11 @@ async fn validate_provider_environment_records_unique_at(
             .await?,
             provider_plugin_environment_keys(catalog, provider),
         )?;
-        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+        runtime_bindings.extend(runtime_credential_bindings_for_provider_with_catalog(
             catalog, provider,
         ));
     }
-    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    validate_runtime_credential_bindings_unambiguous(&runtime_bindings)?;
     Ok(())
 }
 
@@ -2031,40 +2067,44 @@ fn provider_credential_config_key_collision(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DynamicTokenGrantBinding {
+struct RuntimeCredentialBinding {
     provider_name: String,
     credential_name: String,
     host: String,
     port: u32,
     path: String,
     score: u32,
+    proxy_delivery: bool,
 }
 
-fn dynamic_token_grant_bindings_for_provider_with_catalog(
+fn runtime_credential_bindings_for_provider_with_catalog(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-) -> Vec<DynamicTokenGrantBinding> {
+) -> Vec<RuntimeCredentialBinding> {
     let provider_name = provider.object_name().to_string();
     let Some(profile) =
         get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
     else {
         return Vec::new();
     };
-    dynamic_token_grant_bindings_for_profile(&provider_name, &profile.to_proto())
+    runtime_credential_bindings_for_profile(&provider_name, &profile.to_proto())
 }
 
-fn dynamic_token_grant_bindings_for_profile(
+fn runtime_credential_bindings_for_profile(
     provider_name: &str,
     profile: &ProviderProfile,
-) -> Vec<DynamicTokenGrantBinding> {
+) -> Vec<RuntimeCredentialBinding> {
     let mut bindings = Vec::new();
     for credential in &profile.credentials {
-        if credential.token_grant.is_none() {
+        if credential.token_grant.is_none()
+            && ProviderCredentialDelivery::try_from(credential.delivery).unwrap_or_default()
+                != ProviderCredentialDelivery::Proxy
+        {
             continue;
         }
         for endpoint in &profile.endpoints {
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
-                push_dynamic_token_grant_bindings_for_endpoint(
+                push_runtime_credential_bindings_for_endpoint(
                     &mut bindings,
                     provider_name,
                     credential,
@@ -2078,21 +2118,23 @@ fn dynamic_token_grant_bindings_for_profile(
     bindings
 }
 
-fn push_dynamic_token_grant_bindings_for_endpoint(
-    bindings: &mut Vec<DynamicTokenGrantBinding>,
+fn push_runtime_credential_bindings_for_endpoint(
+    bindings: &mut Vec<RuntimeCredentialBinding>,
     provider_name: &str,
     credential: &ProviderProfileCredential,
     endpoint_host: &str,
     endpoint_port: u32,
     endpoint_path: &str,
 ) {
-    push_dynamic_token_grant_binding(
+    push_runtime_credential_binding(
         bindings,
         provider_name,
         &credential.name,
         endpoint_host,
         endpoint_port,
         endpoint_path,
+        ProviderCredentialDelivery::try_from(credential.delivery).unwrap_or_default()
+            == ProviderCredentialDelivery::Proxy,
     );
 
     let Some(token_grant) = credential.token_grant.as_ref() else {
@@ -2118,40 +2160,43 @@ fn push_dynamic_token_grant_bindings_for_endpoint(
         } else {
             override_config.path.as_str()
         };
-        push_dynamic_token_grant_binding(
+        push_runtime_credential_binding(
             bindings,
             provider_name,
             &credential.name,
             override_host,
             override_port,
             override_path,
+            false,
         );
     }
 }
 
-fn push_dynamic_token_grant_binding(
-    bindings: &mut Vec<DynamicTokenGrantBinding>,
+fn push_runtime_credential_binding(
+    bindings: &mut Vec<RuntimeCredentialBinding>,
     provider_name: &str,
     credential_name: &str,
     host: &str,
     port: u32,
     path: &str,
+    proxy_delivery: bool,
 ) {
-    let candidate = DynamicTokenGrantBinding {
+    let candidate = RuntimeCredentialBinding {
         provider_name: provider_name.to_string(),
         credential_name: credential_name.to_string(),
         host: host.to_ascii_lowercase(),
         port,
         path: path.to_string(),
-        score: dynamic_token_grant_match_score(host, path),
+        score: runtime_credential_match_score(host, path),
+        proxy_delivery,
     };
     if !bindings.iter().any(|binding| binding == &candidate) {
         bindings.push(candidate);
     }
 }
 
-fn validate_dynamic_token_grant_bindings_unambiguous(
-    bindings: &[DynamicTokenGrantBinding],
+fn validate_runtime_credential_bindings_unambiguous(
+    bindings: &[RuntimeCredentialBinding],
 ) -> Result<(), Status> {
     for (index, first) in bindings.iter().enumerate() {
         for second in bindings.iter().skip(index + 1) {
@@ -2160,13 +2205,14 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
             {
                 continue;
             }
-            if first.port == second.port
-                && first.score == second.score
-                && host_patterns_can_overlap(&first.host, &second.host)
-                && path_patterns_can_overlap(&first.path, &second.path)
-            {
+            if runtime_credential_bindings_are_ambiguous(first, second) {
+                let guidance = if first.proxy_delivery || second.proxy_delivery {
+                    "attach only one matching provider"
+                } else {
+                    "make one host/path selector more specific or attach only one matching provider"
+                };
                 return Err(Status::failed_precondition(format!(
-                    "dynamic token grants for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; make one host/path selector more specific or attach only one matching provider",
+                    "runtime-injected credentials for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; {guidance}",
                     first.provider_name,
                     first.credential_name,
                     second.provider_name,
@@ -2180,6 +2226,16 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
         }
     }
     Ok(())
+}
+
+fn runtime_credential_bindings_are_ambiguous(
+    first: &RuntimeCredentialBinding,
+    second: &RuntimeCredentialBinding,
+) -> bool {
+    first.port == second.port
+        && (first.proxy_delivery || second.proxy_delivery || first.score == second.score)
+        && host_patterns_can_overlap(&first.host, &second.host)
+        && path_patterns_can_overlap(&first.path, &second.path)
 }
 
 async fn active_provider_environment_keys(
@@ -3216,7 +3272,53 @@ fn validate_provider_credentials(
         )));
     }
 
-    validate_required_static_credentials(profile, provider, pending_credentials)
+    validate_required_static_credentials(profile, provider, pending_credentials)?;
+    validate_proxy_delivered_credential_values(profile, provider, pending_credentials)
+}
+
+/// Reject proxy-delivered credential values the sandbox proxy could not place
+/// in an HTTP header.
+///
+/// The proxy validates the value again immediately before injection, but a
+/// value that can never be injected should fail at provider create or update
+/// time with a message that names the credential, not as a 502 on every
+/// request. Handle-backed credentials are opaque here and rely on the
+/// request-time backstop.
+fn validate_proxy_delivered_credential_values(
+    profile: &ProviderTypeProfile,
+    provider: &Provider,
+    pending_credentials: &HashMap<String, String>,
+) -> Result<(), Status> {
+    for credential in &profile.credentials {
+        if credential.delivery != ProviderCredentialDelivery::Proxy {
+            continue;
+        }
+        for key in credential.accepted_stored_keys() {
+            let value = pending_credentials
+                .get(key)
+                .or_else(|| provider.credentials.get(key))
+                .filter(|value| !value.is_empty());
+            let Some(value) = value else {
+                continue;
+            };
+            if let Err(reason) =
+                openshell_core::provider_credentials::validate_proxy_delivered_credential_value(
+                    &credential.auth_style,
+                    value,
+                )
+            {
+                return Err(Status::invalid_argument(format!(
+                    "provider credential '{key}' cannot be proxy-delivered with auth_style '{}': {reason}",
+                    if credential.auth_style.trim().is_empty() {
+                        "bearer"
+                    } else {
+                        credential.auth_style.trim()
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_required_static_credentials(
@@ -3517,7 +3619,7 @@ async fn profile_attached_sandbox_diagnostics(
             let scope_mismatch = (is_platform_scope && !provider.profile_workspace.is_empty())
                 || (!is_platform_scope && provider.profile_workspace.is_empty());
             if scope_mismatch {
-                bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+                bindings.extend(runtime_credential_bindings_for_provider_with_catalog(
                     catalog, &provider,
                 ));
                 if validate_policy_composition
@@ -3570,7 +3672,7 @@ async fn profile_attached_sandbox_diagnostics(
                         severity: "error".to_string(),
                     });
                 }
-                bindings.extend(dynamic_token_grant_bindings_for_profile(
+                bindings.extend(runtime_credential_bindings_for_profile(
                     provider.object_name(),
                     &profile.to_proto(),
                 ));
@@ -3586,7 +3688,7 @@ async fn profile_attached_sandbox_diagnostics(
                     imported_profiles_used.push(used);
                 }
             } else {
-                bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+                bindings.extend(runtime_credential_bindings_for_provider_with_catalog(
                     catalog, &provider,
                 ));
                 if validate_policy_composition
@@ -3608,14 +3710,14 @@ async fn profile_attached_sandbox_diagnostics(
         if imported_profiles_used.is_empty() {
             continue;
         }
-        if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
+        if let Err(err) = validate_runtime_credential_bindings_unambiguous(&bindings) {
             for (source, profile_id) in &imported_profiles_used {
                 diagnostics.push(ProfileValidationDiagnostic {
                     source: source.clone(),
                     profile_id: profile_id.clone(),
-                    field: "credentials.token_grant.audience_overrides".to_string(),
+                    field: "credentials".to_string(),
                     message: format!(
-                        "{operation} would create ambiguous dynamic token grants on sandbox '{sandbox_name}': {}",
+                        "{operation} would create ambiguous runtime-injected credentials on sandbox '{sandbox_name}': {}",
                         err.message()
                     ),
                     severity: "error".to_string(),
@@ -5074,6 +5176,7 @@ mod tests {
                     )
                     .collect(),
             }),
+            delivery: 0,
         };
         let profile = ProviderProfile {
             id: "keycloak-sso".to_string(),
@@ -5191,8 +5294,29 @@ mod tests {
         .expect_err("equal-specificity dynamic grants should be ambiguous");
 
         assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("dynamic token grants"));
+        assert!(err.message().contains("runtime-injected credentials"));
         assert!(err.message().contains("ambiguous"));
+    }
+
+    #[test]
+    fn proxy_delivery_rejects_overlapping_bindings_at_different_specificity() {
+        let binding = |provider: &str, path: &str| RuntimeCredentialBinding {
+            provider_name: provider.to_string(),
+            credential_name: "api_key".to_string(),
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: path.to_string(),
+            score: runtime_credential_match_score("api.example.com", path),
+            proxy_delivery: true,
+        };
+        let error = validate_runtime_credential_bindings_unambiguous(&[
+            binding("provider-a", "/v1/**"),
+            binding("provider-b", "/v1/chat/**"),
+        ])
+        .expect_err("overlapping proxy delivery must fail before request handling");
+
+        assert!(error.message().contains("runtime-injected credentials"));
+        assert!(error.message().contains("ambiguous"));
     }
 
     #[tokio::test]
@@ -5286,7 +5410,7 @@ mod tests {
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("import would create ambiguous dynamic token grants")
+                .contains("import would create ambiguous runtime-injected credentials")
         }));
     }
 
@@ -5624,7 +5748,7 @@ mod tests {
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("update would create ambiguous dynamic token grants")
+                .contains("update would create ambiguous runtime-injected credentials")
         }));
     }
 
@@ -5775,6 +5899,7 @@ mod tests {
                 ],
             }),
             token_grant: None,
+            delivery: 0,
         }
     }
 
@@ -5814,6 +5939,7 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: None,
+            delivery: 0,
         }
     }
 
@@ -5841,7 +5967,269 @@ mod tests {
                 cache_ttl_seconds: 300,
                 audience_overrides: Vec::new(),
             }),
+            delivery: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn resolved_proxy_delivery_keeps_credential_out_of_workload_environment() {
+        let state = test_server_state().await;
+        let mut credential = static_credential("api_key", "API_KEY", true);
+        credential.delivery = ProviderCredentialDelivery::Proxy as i32;
+        let mut profile = custom_profile("proxy-auth-provider");
+        profile.credentials = vec![credential];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            access: "full".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "proxy-auth-provider.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("import profile");
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_credential_value(
+                "proxy-auth",
+                "proxy-auth-provider",
+                "API_KEY",
+                "secret",
+            ),
+        )
+        .await
+        .expect("create provider");
+
+        let names = vec!["proxy-auth".to_string()];
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog");
+        let records = load_provider_environment_records(state.store.as_ref(), "default", &names)
+            .await
+            .expect("records");
+        let environment = resolve_provider_environment_from_records_with_policy_bindings(
+            state.store.as_ref(),
+            &catalog,
+            &records,
+            &HashMap::new(),
+        )
+        .await
+        .expect("provider environment");
+        assert!(
+            environment.dynamic_credentials.is_empty(),
+            "proxy delivery must not be advertised as a dynamic credential"
+        );
+        let binding = environment
+            .static_credential_bindings
+            .get("API_KEY")
+            .expect("static binding");
+        assert_eq!(binding.delivery, ProviderCredentialDelivery::Proxy as i32);
+        assert_eq!(binding.auth_style, "bearer");
+        assert_eq!(binding.header_name, "authorization");
+        let credentials =
+            openshell_core::provider_credentials::ProviderCredentialState::from_bound_environment(
+                1,
+                environment.environment,
+                environment.credential_expires_at_ms,
+                environment.dynamic_credentials,
+                environment.static_credential_bindings,
+                Vec::new(),
+            )
+            .expect("credential state");
+
+        assert!(!credentials.snapshot().child_env.contains_key("API_KEY"));
+        assert_eq!(
+            credentials
+                .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+                .expect("endpoint resolver")
+                .resolve_current_env_key_checked("API_KEY", "test")
+                .expect("authorized endpoint"),
+            Some("secret")
+        );
+        assert_eq!(
+            credentials.proxy_delivered_credentials_for_endpoint("api.example.com", 443, "/v1/x"),
+            vec![
+                openshell_core::provider_credentials::ProxyDeliveredCredential {
+                    env_key: "API_KEY".to_string(),
+                    auth_style: "bearer".to_string(),
+                    header_name: "authorization".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn environment_delivery_binding_carries_no_placement_metadata() {
+        let state = test_server_state().await;
+        let mut profile = custom_profile("env-auth-provider");
+        profile.credentials = vec![static_credential("api_key", "API_KEY", true)];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            access: "full".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "env-auth-provider.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("import profile");
+        create_provider_record(
+            state.store.as_ref(),
+            "default",
+            provider_with_credential_value("env-auth", "env-auth-provider", "API_KEY", "secret"),
+        )
+        .await
+        .expect("create provider");
+
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog");
+        let records = load_provider_environment_records(
+            state.store.as_ref(),
+            "default",
+            &["env-auth".to_string()],
+        )
+        .await
+        .expect("records");
+        let environment = resolve_provider_environment_from_records_with_policy_bindings(
+            state.store.as_ref(),
+            &catalog,
+            &records,
+            &HashMap::new(),
+        )
+        .await
+        .expect("provider environment");
+
+        let binding = environment
+            .static_credential_bindings
+            .get("API_KEY")
+            .expect("static binding");
+        assert_eq!(
+            binding.delivery,
+            ProviderCredentialDelivery::Environment as i32
+        );
+        assert!(binding.auth_style.is_empty());
+        assert!(binding.header_name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_delivered_credential_values_are_validated_on_create_and_update() {
+        let state = test_server_state().await;
+        let mut credential = static_credential("api_key", "API_KEY", true);
+        credential.delivery = ProviderCredentialDelivery::Proxy as i32;
+        let mut profile = custom_profile("proxy-auth-provider");
+        profile.credentials = vec![credential];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            access: "full".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            &state,
+            authed_request(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "proxy-auth-provider.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("import profile");
+
+        let err = handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "proxy-auth",
+                    "proxy-auth-provider",
+                    "API_KEY",
+                    "not a token68 value",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect_err("bearer values must be token68 at create time");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains("provider credential 'API_KEY' cannot be proxy-delivered"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("not a token68 value"),
+            "credential values must not be echoed: {}",
+            err.message()
+        );
+
+        handle_create_provider(
+            &state,
+            authed_request(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "proxy-auth",
+                    "proxy-auth-provider",
+                    "API_KEY",
+                    "sk-live_token.value~ok==",
+                )),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .expect("token68 bearer value is accepted");
+
+        let catalog = ProviderProfileSources::with_default_sources()
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog");
+        let profile =
+            get_provider_type_profile_for_scope(&catalog, "proxy-auth-provider", "default")
+                .expect("imported profile");
+        let stored = provider_with_credential_value(
+            "proxy-auth",
+            "proxy-auth-provider",
+            "API_KEY",
+            "sk-live_token.value~ok==",
+        );
+        validate_provider_credentials(
+            &profile,
+            &stored,
+            &HashMap::from([("API_KEY".to_string(), "rotated with space".to_string())]),
+        )
+        .expect_err("pending update values are validated too");
+        validate_provider_credentials(
+            &profile,
+            &stored,
+            &HashMap::from([("API_KEY".to_string(), "rotated-ok".to_string())]),
+        )
+        .expect("valid pending update value");
     }
 
     #[tokio::test]
@@ -9034,6 +9422,7 @@ mod tests {
                                 ],
                             }),
                             token_grant: None,
+                            delivery: 0,
                         }],
                         endpoints: vec![],
                         binaries: vec![],

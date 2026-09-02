@@ -4263,6 +4263,8 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "axum",
+ "base64 0.22.1",
  "clap",
  "futures",
  "miette",
@@ -4429,6 +4431,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "uuid",
 ]
 
 [[package]]

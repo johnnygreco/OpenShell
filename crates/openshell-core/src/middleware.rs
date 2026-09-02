@@ -11,8 +11,9 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, MiddlewareManifest,
-    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    AgentConversationEvaluation, AgentConversationResult, HttpHeader, HttpRequestEvaluation,
+    HttpRequestResult, HttpRequestTarget, MiddlewareManifest, RequestContext,
+    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
 
@@ -43,6 +44,11 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status>;
 
+    async fn evaluate_agent_conversation(
+        &self,
+        request: Request<AgentConversationEvaluation>,
+    ) -> Result<Response<AgentConversationResult>, Status>;
+
     async fn open_websocket_session(
         &self,
         requests: mpsc::Receiver<WebSocketSessionEvent>,
@@ -62,6 +68,7 @@ pub struct HttpRequestView<'a> {
     headers: &'a [HttpHeader],
     body: &'a [u8],
     middleware_name: &'a str,
+    agent_attestation: &'a [u8],
 }
 
 impl<'a> HttpRequestView<'a> {
@@ -84,7 +91,15 @@ impl<'a> HttpRequestView<'a> {
             headers,
             body,
             middleware_name,
+            agent_attestation: &[],
         }
+    }
+
+    /// Attach a supervisor-resolved agent admission attestation to this view.
+    #[must_use]
+    pub fn with_agent_attestation(mut self, agent_attestation: &'a [u8]) -> Self {
+        self.agent_attestation = agent_attestation;
+        self
     }
 
     /// Return the typed middleware phase selected for this invocation.
@@ -128,6 +143,13 @@ impl<'a> HttpRequestView<'a> {
     #[must_use]
     pub fn middleware_name(self) -> &'a str {
         self.middleware_name
+    }
+
+    /// Return the supervisor-resolved agent admission attestation for this
+    /// middleware stage. The value is empty for ordinary requests.
+    #[must_use]
+    pub fn agent_attestation(self) -> &'a [u8] {
+        self.agent_attestation
     }
 }
 
@@ -176,6 +198,7 @@ impl<'a> HttpRequestView<'a> {
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
 ///                 timeout: String::new(),
+///                 ..Default::default()
 ///             }],
 ///             expected_audience: String::new(),
 ///         }

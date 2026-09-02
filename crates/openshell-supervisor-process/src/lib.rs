@@ -22,7 +22,10 @@ pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
 
+mod admission_token;
 mod unix_socket;
+
+pub use admission_token::{AdmissionTokenRegistry, REQUIRE_CALLER_TOKEN_ENV};
 
 #[cfg(target_os = "linux")]
 pub mod bypass_monitor;

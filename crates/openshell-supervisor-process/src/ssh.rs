@@ -130,6 +130,7 @@ pub async fn run_ssh_server(
     enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
     main_session: Arc<MainSession>,
+    admission_tokens: Option<crate::admission_token::AdmissionTokenRegistry>,
 ) -> Result<()> {
     let (listener, config, ca_paths) = match ssh_server_init(
         &listen_path,
@@ -167,6 +168,7 @@ pub async fn run_ssh_server(
                 let provider_credentials = provider_credentials.clone();
                 let user_environment = user_environment.clone();
                 let main_session = Arc::clone(&main_session);
+                let admission_tokens = admission_tokens.clone();
 
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(
@@ -182,6 +184,7 @@ pub async fn run_ssh_server(
                         resolved_identity,
                         enforcement_mode,
                         main_session,
+                        admission_tokens,
                     )
                     .await
                     {
@@ -348,6 +351,7 @@ async fn handle_connection(
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     main_session: Arc<MainSession>,
+    admission_tokens: Option<crate::admission_token::AdmissionTokenRegistry>,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -374,6 +378,7 @@ async fn handle_connection(
         resolved_identity,
         enforcement_mode,
         main_session,
+        admission_tokens,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -464,6 +469,7 @@ struct SshHandler {
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
     main_session: Arc<MainSession>,
+    admission_tokens: Option<crate::admission_token::AdmissionTokenRegistry>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -497,6 +503,7 @@ impl SshHandler {
         resolved_identity: ResolvedProcessIdentity,
         enforcement_mode: ProcessEnforcementMode,
         main_session: Arc<MainSession>,
+        admission_tokens: Option<crate::admission_token::AdmissionTokenRegistry>,
     ) -> Self {
         Self {
             policy,
@@ -509,6 +516,7 @@ impl SshHandler {
             resolved_identity,
             enforcement_mode,
             main_session,
+            admission_tokens,
             channels: HashMap::new(),
         }
     }
@@ -860,6 +868,7 @@ impl russh::server::Handler for SshHandler {
                 &self.user_environment,
                 self.resolved_identity,
                 self.enforcement_mode,
+                None,
             )?;
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
@@ -1089,6 +1098,7 @@ impl SshHandler {
                 &self.user_environment,
                 self.resolved_identity,
                 self.enforcement_mode,
+                self.admission_tokens.as_ref(),
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(InputSender::Process(input_sender));
@@ -1110,6 +1120,7 @@ impl SshHandler {
                 &self.user_environment,
                 self.resolved_identity,
                 self.enforcement_mode,
+                self.admission_tokens.as_ref(),
             )?;
             state.input_sender = Some(InputSender::Process(input_sender));
         }
@@ -1258,6 +1269,7 @@ fn spawn_pty_shell(
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
+    admission_tokens: Option<&crate::admission_token::AdmissionTokenRegistry>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
@@ -1309,6 +1321,9 @@ fn spawn_pty_shell(
         user_environment,
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
+    let prepared_token = admission_tokens
+        .map(|registry| registry.prepare_child(&mut cmd))
+        .transpose()?;
 
     if let Some(dir) = workspace.root() {
         cmd.current_dir(dir);
@@ -1345,6 +1360,8 @@ fn spawn_pty_shell(
     let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
     #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
+    let token_registration =
+        prepared_token.map(crate::admission_token::PreparedToken::child_spawned);
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
@@ -1393,6 +1410,7 @@ fn spawn_pty_shell(
     let runtime_exit = runtime;
     std::thread::spawn(move || {
         let status = child.wait().ok();
+        drop(token_registration);
         #[cfg(target_os = "linux")]
         managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
@@ -1434,6 +1452,7 @@ fn spawn_pipe_exec(
     user_environment: &HashMap<String, String>,
     resolved_identity: ResolvedProcessIdentity,
     enforcement_mode: ProcessEnforcementMode,
+    admission_tokens: Option<&crate::admission_token::AdmissionTokenRegistry>,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
     let mut cmd = command.map_or_else(
         || {
@@ -1469,6 +1488,9 @@ fn spawn_pipe_exec(
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let prepared_token = admission_tokens
+        .map(|registry| registry.prepare_child(&mut cmd))
+        .transpose()?;
 
     if let Some(dir) = workspace.root() {
         cmd.current_dir(dir);
@@ -1504,6 +1526,8 @@ fn spawn_pipe_exec(
     let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
     #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
+    let token_registration =
+        prepared_token.map(crate::admission_token::PreparedToken::child_spawned);
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
     #[cfg(target_os = "linux")]
@@ -1578,6 +1602,7 @@ fn spawn_pipe_exec(
     let runtime_exit = runtime;
     std::thread::spawn(move || {
         let status = child.wait().ok();
+        drop(token_registration);
         #[cfg(target_os = "linux")]
         managed_children::unregister(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
@@ -2547,6 +2572,7 @@ mod tests {
             ResolvedProcessIdentity::default(),
             ProcessEnforcementMode::NetworkOnly,
             main_session,
+            None,
         );
 
         let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);

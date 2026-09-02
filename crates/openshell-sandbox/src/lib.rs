@@ -16,6 +16,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
+mod agent_bridge;
 mod denial_aggregator;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod google_cloud_metadata;
@@ -72,6 +73,7 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::proposals::AgentProposals;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_supervisor_middleware::{ChainRunner, OnError};
 use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_network::proxy::ProxyHandle;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
@@ -96,6 +98,122 @@ fn has_network_runtime_capability(capabilities: Option<&str>, required: &str) ->
 }
 const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
 const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
+async fn select_agent_bridge(
+    runner: &ChainRunner,
+    policy: &openshell_core::proto::SandboxPolicy,
+) -> Result<Option<agent_bridge::BridgeSelection>> {
+    let require_caller_token = require_agent_bridge_caller_token(
+        std::env::var(openshell_supervisor_process::REQUIRE_CALLER_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    let bindings = runner.agent_conversation_bindings().await?;
+    let mut matches = policy.network_middlewares.iter().filter(|(_, config)| {
+        bindings
+            .iter()
+            .any(|binding| binding.middleware_name == config.middleware)
+    });
+    let Some((config_name, config)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(miette::miette!(
+            "managed agent admission requires exactly one configured agent-conversation middleware"
+        ));
+    }
+    if OnError::parse(&config.on_error)? != OnError::FailClosed {
+        return Err(miette::miette!(
+            "agent admission middleware config '{config_name}' must use fail_closed"
+        ));
+    }
+    let endpoints = config.endpoints.as_ref().ok_or_else(|| {
+        miette::miette!("agent admission middleware config '{config_name}' requires endpoints")
+    })?;
+    if endpoints.include.len() != 1
+        || !endpoints.exclude.is_empty()
+        || endpoints.include[0].contains('*')
+    {
+        return Err(miette::miette!(
+            "agent admission middleware config '{config_name}' requires one exact provider host without exclusions"
+        ));
+    }
+    let provider_host = &endpoints.include[0];
+    let (provider_scheme, provider_port) = exact_provider_endpoint(policy, provider_host)?;
+    let middleware_config = config.config.clone().unwrap_or_default();
+    let advertised = bindings
+        .into_iter()
+        .filter(|binding| binding.middleware_name == config.middleware)
+        .map(|advertised| {
+            Ok(agent_bridge::BridgeBinding {
+                harness: advertised.binding.harness,
+                hook: advertised.binding.hook,
+                schema_version: advertised.binding.schema_version,
+                max_payload_bytes: usize::try_from(advertised.binding.max_payload_bytes).map_err(
+                    |_| miette::miette!("agent admission binding payload limit is unsupported"),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(agent_bridge::BridgeSelection {
+        middleware_name: config.middleware.clone(),
+        bindings: advertised,
+        provider_scheme,
+        provider_host: provider_host.clone(),
+        provider_port,
+        middleware_config,
+        require_caller_token,
+    }))
+}
+
+fn require_agent_bridge_caller_token(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(miette::miette!(
+            "{} must be 'true' or 'false'",
+            openshell_supervisor_process::REQUIRE_CALLER_TOKEN_ENV
+        )),
+    }
+}
+
+fn exact_provider_endpoint(
+    policy: &openshell_core::proto::SandboxPolicy,
+    provider_host: &str,
+) -> Result<(String, u32)> {
+    let mut endpoints = policy
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .filter(|endpoint| endpoint.host.eq_ignore_ascii_case(provider_host))
+        .flat_map(|endpoint| {
+            let ports = if endpoint.ports.is_empty() {
+                vec![endpoint.port]
+            } else {
+                endpoint.ports.clone()
+            };
+            ports.into_iter().map(move |port| {
+                let scheme = if endpoint.tls == "terminate" || port == 443 {
+                    "https"
+                } else {
+                    "http"
+                };
+                (scheme.to_string(), port)
+            })
+        })
+        .filter(|(_, port)| *port > 0)
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    match endpoints.as_slice() {
+        [endpoint] => Ok(endpoint.clone()),
+        [] => Err(miette::miette!(
+            "agent admission provider host '{provider_host}' requires one exact network policy endpoint"
+        )),
+        _ => Err(miette::miette!(
+            "agent admission provider host '{provider_host}' resolves to multiple network policy endpoints"
+        )),
+    }
+}
 
 /// Run a command in the sandbox.
 ///
@@ -562,6 +680,77 @@ pub async fn run_sandbox(
         None
     };
 
+    let agent_bridge = match (opa_engine.as_ref(), retained_proto.as_ref()) {
+        (Some(engine), Some(proto)) => {
+            let runner = engine.middleware_runner()?;
+            select_agent_bridge(&runner, proto).await?
+        }
+        _ => None,
+    };
+    let admission_tokens = agent_bridge
+        .as_ref()
+        .map(|_| openshell_supervisor_process::AdmissionTokenRegistry::default());
+    let agent_bridge_runtime = if let Some(selection) = agent_bridge {
+        if sidecar_network_enforcement {
+            return Err(miette::miette!(
+                "managed agent admission is not supported in sidecar topology"
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let listener = netns
+            .as_ref()
+            .ok_or_else(|| miette::miette!("agent admission bridge requires network enforcement"))?
+            .bind_tcp_in_netns(agent_bridge::BRIDGE_ADDR)
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to bind agent admission bridge")?;
+        #[cfg(not(target_os = "linux"))]
+        let listener = tokio::net::TcpListener::bind(agent_bridge::BRIDGE_ADDR)
+            .await
+            .into_diagnostic()?;
+        let engine = opa_engine
+            .as_ref()
+            .expect("agent bridge requires OPA")
+            .clone();
+        let (runtime_tx, runtime_rx) =
+            tokio::sync::watch::channel(agent_bridge::BridgeRuntimeSnapshot {
+                generation: engine.current_generation(),
+                selection: Some(selection),
+            });
+        if let Some(engine_ready) = networking
+            .as_ref()
+            .map(|networking| networking.engine_ready.clone())
+        {
+            synchronize_agent_bridge_after_engine_ready(
+                runtime_tx.clone(),
+                engine.clone(),
+                engine_ready,
+            );
+        }
+        agent_bridge::spawn(
+            listener,
+            engine,
+            runtime_rx,
+            sandbox_id.clone().unwrap_or_default(),
+            sandbox_name_for_agg.clone().unwrap_or_default(),
+            workspace_rx.clone(),
+            admission_tokens
+                .clone()
+                .expect("selected agent bridge requires caller token registry"),
+        );
+        provider_env.insert(
+            agent_bridge::BRIDGE_URL_ENV.into(),
+            agent_bridge::BRIDGE_URL.into(),
+        );
+        info!(
+            url = agent_bridge::BRIDGE_URL,
+            "agent admission bridge ready"
+        );
+        Some(runtime_tx)
+    } else {
+        None
+    };
+
     #[cfg(target_os = "linux")]
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
@@ -772,6 +961,7 @@ pub async fn run_sandbox(
                 capable: transparent_tcp_capable,
                 substrate_ready: transparent_tcp_substrate_ready,
             },
+            agent_bridge_runtime: agent_bridge_runtime.clone(),
         };
 
         tokio::spawn(async move {
@@ -971,6 +1161,7 @@ pub async fn run_sandbox(
             main_env,
             ca_file_paths,
             agent_proposals.clone(),
+            admission_tokens,
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -2775,7 +2966,7 @@ async fn reload_gateway_policy_runtime(
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
     transparent_tcp: TransparentTcpReloadState,
-) -> std::result::Result<(), GatewayRuntimeReloadError> {
+) -> std::result::Result<Option<agent_bridge::BridgeSelection>, GatewayRuntimeReloadError> {
     if let Some(policy) = policy
         && policy_contains_explicit_tcp(policy)
     {
@@ -2802,16 +2993,33 @@ async fn reload_gateway_policy_runtime(
             )
             .await
             .map_err(GatewayRuntimeReloadError::MiddlewareRegistry)?;
+            let candidate_runner = engine
+                .middleware_runner()
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?
+                .with_replacement_registry(registry.clone());
+            let selection = select_agent_bridge(&candidate_runner, policy)
+                .await
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
             engine
                 .reload_policy_and_middleware_from_proto_with_pid(policy, entrypoint_pid, registry)
-                .map_err(GatewayRuntimeReloadError::PolicyValidation)
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+            Ok(selection)
         }
         // Policy-only change: the installed registry already matches the
         // delivered service set, so swap the engine alone. This must not
         // require middleware reachability.
-        Some(policy) => engine
-            .reload_from_proto_with_pid(policy, entrypoint_pid)
-            .map_err(GatewayRuntimeReloadError::PolicyValidation),
+        Some(policy) => {
+            let runner = engine
+                .middleware_runner()
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+            let selection = select_agent_bridge(&runner, policy)
+                .await
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+            engine
+                .reload_from_proto_with_pid(policy, entrypoint_pid)
+                .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
+            Ok(selection)
+        }
         None => Err(GatewayRuntimeReloadError::PolicyValidation(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
@@ -3350,6 +3558,7 @@ struct PolicyPollLoopContext {
     middleware_connector: MiddlewareConnector,
     /// Immutable driver capability and startup substrate state.
     transparent_tcp: TransparentTcpReloadState,
+    agent_bridge_runtime: Option<tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>>,
 }
 
 type MiddlewareConnector = Arc<
@@ -3634,6 +3843,56 @@ fn apply_policy_validation_failure(
             })
         }
     }
+}
+
+fn synchronize_agent_bridge_generation(
+    runtime: Option<&tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>>,
+    disposition: &PolicyValidationFailureDisposition,
+) {
+    if !disposition.previous_policy_active {
+        return;
+    }
+    if let Some(runtime) = runtime {
+        let mut snapshot = runtime.borrow().clone();
+        snapshot.generation = disposition.active_generation;
+        runtime.send_replace(snapshot);
+    }
+}
+
+fn synchronize_agent_bridge_after_engine_ready(
+    runtime: tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>,
+    engine: Arc<OpaEngine>,
+    mut engine_ready: tokio::sync::watch::Receiver<bool>,
+) {
+    let initial_generation = engine.current_generation();
+    tokio::spawn(async move {
+        if !*engine_ready.borrow() && engine_ready.changed().await.is_err() {
+            return;
+        }
+        if !*engine_ready.borrow() {
+            return;
+        }
+        let active_generation = engine.current_generation();
+        synchronize_agent_bridge_generation_if_unchanged(
+            &runtime,
+            initial_generation,
+            active_generation,
+        );
+    });
+}
+
+fn synchronize_agent_bridge_generation_if_unchanged(
+    runtime: &tokio::sync::watch::Sender<agent_bridge::BridgeRuntimeSnapshot>,
+    expected_generation: u64,
+    active_generation: u64,
+) {
+    runtime.send_if_modified(|snapshot| {
+        if snapshot.generation != expected_generation || snapshot.generation == active_generation {
+            return false;
+        }
+        snapshot.generation = active_generation;
+        true
+    });
 }
 
 fn policy_validation_failure_events(
@@ -3973,6 +4232,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                         rejected.version,
                         &rejected.validation_error,
                     )?;
+                    synchronize_agent_bridge_generation(
+                        ctx.agent_bridge_runtime.as_ref(),
+                        &disposition,
+                    );
                     emit_policy_validation_failure(
                         &disposition,
                         rejected.version,
@@ -4092,7 +4355,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
             .await;
 
             match runtime_result {
-                Ok(()) => {
+                Ok(agent_selection) => {
                     policy_runtime_reconciled = true;
                     let policy = result
                         .policy
@@ -4195,6 +4458,12 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     );
                     middleware_registry_status = MiddlewareRegistryStatus::Synchronized;
                     last_failed_runtime_revision = None;
+                    if let Some(runtime) = ctx.agent_bridge_runtime.as_ref() {
+                        runtime.send_replace(agent_bridge::BridgeRuntimeSnapshot {
+                            generation: ctx.opa_engine.current_generation(),
+                            selection: agent_selection,
+                        });
+                    }
                 }
                 Err(failure) => {
                     let failed_revision = FailedRuntimeRevision::new(
@@ -4215,6 +4484,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                                 error,
                                 disposition,
                             } => {
+                                synchronize_agent_bridge_generation(
+                                    ctx.agent_bridge_runtime.as_ref(),
+                                    &disposition,
+                                );
                                 emit_policy_validation_failure(
                                     &disposition,
                                     result.version,
@@ -4516,6 +4789,88 @@ mod tests {
             }),
             scope: openshell_core::proto::SettingScope::Global.into(),
         }
+    }
+
+    #[test]
+    fn agent_provider_endpoint_must_be_exact_and_unambiguous() {
+        let mut policy = openshell_core::proto::SandboxPolicy::default();
+        policy.network_policies.insert(
+            "provider".into(),
+            openshell_core::proto::NetworkPolicyRule {
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    ports: vec![443],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            exact_provider_endpoint(&policy, "API.EXAMPLE.COM").unwrap(),
+            ("https".into(), 443)
+        );
+        assert!(exact_provider_endpoint(&policy, "missing.example.com").is_err());
+
+        policy
+            .network_policies
+            .get_mut("provider")
+            .expect("provider rule")
+            .endpoints[0]
+            .ports
+            .push(8443);
+        assert!(exact_provider_endpoint(&policy, "api.example.com").is_err());
+    }
+
+    #[test]
+    fn agent_bridge_caller_token_defaults_on_and_has_explicit_debug_opt_out() {
+        assert!(require_agent_bridge_caller_token(None).unwrap());
+        assert!(require_agent_bridge_caller_token(Some("true")).unwrap());
+        assert!(!require_agent_bridge_caller_token(Some("false")).unwrap());
+        assert!(require_agent_bridge_caller_token(Some("0")).is_err());
+    }
+
+    #[test]
+    fn retained_policy_generation_keeps_agent_bridge_in_sync() {
+        let (runtime, receiver) =
+            tokio::sync::watch::channel(agent_bridge::BridgeRuntimeSnapshot {
+                generation: 2,
+                selection: None,
+            });
+        let retained = PolicyValidationFailureDisposition {
+            configured_mode: PolicyValidationFailureMode::RetainLastValid,
+            mode: PolicyValidationFailureMode::RetainLastValid,
+            previous_policy_active: true,
+            active_generation: 3,
+        };
+
+        synchronize_agent_bridge_generation(Some(&runtime), &retained);
+
+        assert_eq!(receiver.borrow().generation, 3);
+
+        let fail_closed = PolicyValidationFailureDisposition {
+            configured_mode: PolicyValidationFailureMode::FailClosed,
+            mode: PolicyValidationFailureMode::FailClosed,
+            previous_policy_active: false,
+            active_generation: 4,
+        };
+        synchronize_agent_bridge_generation(Some(&runtime), &fail_closed);
+        assert_eq!(receiver.borrow().generation, 3);
+    }
+
+    #[test]
+    fn entrypoint_policy_rebuild_only_updates_the_generation_it_started_from() {
+        let (runtime, receiver) =
+            tokio::sync::watch::channel(agent_bridge::BridgeRuntimeSnapshot {
+                generation: 2,
+                selection: None,
+            });
+
+        synchronize_agent_bridge_generation_if_unchanged(&runtime, 2, 3);
+        assert_eq!(receiver.borrow().generation, 3);
+
+        synchronize_agent_bridge_generation_if_unchanged(&runtime, 2, 4);
+        assert_eq!(receiver.borrow().generation, 3);
     }
 
     #[test]
@@ -5058,6 +5413,7 @@ network_policies:
             extension_authentication_enabled: false,
             middleware_connector,
             transparent_tcp: TransparentTcpReloadState::default(),
+            agent_bridge_runtime: None,
         }
     }
 

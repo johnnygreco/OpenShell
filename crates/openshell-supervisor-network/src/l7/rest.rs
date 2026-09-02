@@ -2105,7 +2105,7 @@ fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
+pub(crate) fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let mut out = String::with_capacity(header_str.len());

@@ -362,6 +362,7 @@ state_dir = "${VM_DRIVER_STATE_DIR}"
 EOF
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
+bash "${ROOT}/tasks/scripts/append-gateway-config-fragment.sh" "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"
