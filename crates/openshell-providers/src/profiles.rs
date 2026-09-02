@@ -3044,6 +3044,9 @@ fn validate_injected_header_name(
         _ => return Ok(()),
     };
     if header_name.is_empty() {
+        // `validate_profile_set` already reports a missing header_name for
+        // `header` auth before reaching this check. Kept so the function is
+        // self-contained for callers that validate a single credential.
         return Err(format!("{context} auth_style header requires header_name"));
     }
     let valid = header_name.bytes().all(|byte| {
@@ -3799,6 +3802,204 @@ endpoints:
         let diagnostics = validate_profile_set(&[("mixed.yaml".to_string(), profile)]);
         assert!(diagnostics.iter().any(|diagnostic| diagnostic.message
             == "provider profiles cannot combine proxy-delivered credentials with token grants"));
+    }
+
+    fn proxy_delivery_diagnostics(yaml: &str) -> Vec<String> {
+        let profile = parse_profile_yaml(yaml).expect("profile should parse");
+        validate_profile_set(&[("proxy.yaml".to_string(), profile)])
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[test]
+    fn proxy_delivery_requires_inspected_rest_endpoints() {
+        let messages = proxy_delivery_diagnostics(
+            r"
+id: proxy-endpoints
+display_name: Proxy Endpoints
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: bearer
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    tls: skip
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    access: full
+  - host: ws.example.com
+    port: 443
+    protocol: websocket
+    access: read-write
+",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "proxy-delivered credentials do not support tls: skip"),
+            "{messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| *message == "proxy-delivered credentials require protocol: rest")
+                .count(),
+            2,
+            "{messages:?}"
+        );
+
+        let messages = proxy_delivery_diagnostics(
+            r"
+id: proxy-no-endpoints
+display_name: Proxy No Endpoints
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: bearer
+",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "proxy-delivered credentials require a profile endpoint"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_delivery_rejects_unsupported_placement() {
+        for auth_style in ["basic", "query", "path"] {
+            let extra = match auth_style {
+                "query" => "    query_param: api_key\n",
+                "path" => "    path_template: /v1/{credential}/x\n",
+                _ => "",
+            };
+            let messages = proxy_delivery_diagnostics(&format!(
+                r"
+id: proxy-style
+display_name: Proxy Style
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: {auth_style}
+{extra}endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+"
+            ));
+            assert!(
+                messages.iter().any(|message| message
+                    == "proxy-delivered credentials support auth_style bearer or header"),
+                "{auth_style}: {messages:?}"
+            );
+        }
+
+        let messages = proxy_delivery_diagnostics(
+            r"
+id: proxy-framing-header
+display_name: Proxy Framing Header
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: header
+    header_name: Content-Length
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        );
+        assert!(
+            messages.iter().any(|message| message
+                == "proxy delivery header_name may not override HTTP framing or connection headers"),
+            "{messages:?}"
+        );
+
+        let messages = proxy_delivery_diagnostics(
+            r"
+id: proxy-bad-header
+display_name: Proxy Bad Header
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: proxy
+    auth_style: bearer
+    header_name: 'x api key'
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message
+                    == "proxy delivery header_name is not a valid HTTP header name"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_delivery_rejects_token_grant_on_same_credential() {
+        let messages = proxy_delivery_diagnostics(
+            r"
+id: proxy-token-grant
+display_name: Proxy Token Grant
+credentials:
+  - name: access_token
+    env_vars: [ACCESS_TOKEN]
+    delivery: proxy
+    auth_style: bearer
+    token_grant:
+      token_endpoint: https://login.example.com/oauth2/token
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+",
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message == "proxy delivery is only valid for static credentials"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_delivery_rejects_unknown_delivery_values() {
+        let error = parse_profile_yaml(
+            r"
+id: proxy-unknown
+display_name: Proxy Unknown
+credentials:
+  - name: api_key
+    env_vars: [API_KEY]
+    delivery: sidecar
+",
+        )
+        .expect_err("unknown delivery must fail to parse");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported provider credential delivery: sidecar"),
+            "{error}"
+        );
     }
 
     #[test]

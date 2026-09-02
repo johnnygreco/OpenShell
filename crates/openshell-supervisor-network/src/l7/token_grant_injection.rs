@@ -1,16 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Endpoint-bound dynamic token grant injection for HTTP relay paths.
+//! Endpoint-bound runtime credential injection for HTTP relay paths: dynamic
+//! token grants and proxy-delivered static credentials.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
-use openshell_core::proto::{
-    ProviderCredentialDelivery, ProviderCredentialTokenGrant, ProviderProfileCredential,
-};
+use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+use openshell_core::provider_credentials::ProxyDeliveredCredential;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, Url as OcsfUrl, ctx::ctx as ocsf_ctx, ocsf_emit,
@@ -74,8 +74,14 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// Authorization header before forwarding the request upstream.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
-        dyn_creds.read().map_or(None, |creds_guard| {
+    let token_grant_credential = match ctx.dynamic_credentials.as_ref() {
+        None => None,
+        Some(dyn_creds) => {
+            // A poisoned registry must fail closed. Treating it as "no
+            // credential" would forward the request unauthenticated.
+            let creds_guard = dyn_creds
+                .read()
+                .map_err(|_| miette!("dynamic credential registry is poisoned"))?;
             creds_guard
                 .iter()
                 .filter_map(|(key, cred)| {
@@ -87,8 +93,8 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                 })
                 .max_by_key(|(score, key, _)| (*score, key.clone()))
                 .map(|(_, key, cred)| (key, cred))
-        })
-    });
+        }
+    };
 
     if let Some((provider_key, cred)) = token_grant_credential
         && let Some(ref token_grant) = cred.token_grant
@@ -165,52 +171,138 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
 }
 
 /// Injects an endpoint-bound static credential that opted into proxy delivery.
+///
+/// The static credential bindings in `ctx.provider_credentials` are the single
+/// source of truth: a binding whose endpoint authorizes this request and whose
+/// delivery mode is `proxy` is resolved through the request-scoped
+/// `ctx.secret_resolver` and written as the complete outbound header. Requests
+/// with no matching proxy-delivered binding pass through unchanged.
+///
+/// Every outcome that touches a credential is recorded as an OCSF HTTP
+/// activity event, without the credential value.
 pub fn inject_static_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let credential = ctx.dynamic_credentials.as_ref().and_then(|credentials| {
-        credentials.read().map_or(None, |credentials| {
-            credentials
-                .iter()
-                .filter_map(|(key, credential)| {
-                    let score =
-                        dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-                    (ProviderCredentialDelivery::try_from(credential.delivery).unwrap_or_default()
-                        == ProviderCredentialDelivery::Proxy)
-                        .then(|| (score, key.clone(), credential.clone()))
-                })
-                .max_by_key(|(score, key, _)| (*score, key.clone()))
-                .map(|(_, key, credential)| (key, credential))
-        })
-    });
-
-    let Some((provider_key, credential)) = credential else {
+    let Some(state) = ctx.provider_credentials.as_ref() else {
         return Ok(req);
     };
+    let bindings =
+        state.proxy_delivered_credentials_for_endpoint(&ctx.host, ctx.port, request_path);
+    if bindings.is_empty() {
+        return Ok(req);
+    }
+    let env_keys = bindings
+        .iter()
+        .map(|binding| ocsf_message_field(&binding.env_key))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    match inject_proxy_delivered_header(&req.raw_header, ctx, &bindings) {
+        Ok((header_name, raw_header)) => {
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Proxy-delivered credential {} injected as {} to {}:{}",
+                        env_keys,
+                        ocsf_message_field(&header_name),
+                        ctx.host,
+                        ctx.port
+                    ))
+                    .build()
+            );
+            Ok(L7Request {
+                action: req.action,
+                target: req.target,
+                query_params: req.query_params,
+                raw_header,
+                body_length: req.body_length,
+            })
+        }
+        Err(error) => {
+            warn!(
+                host = %ctx.host,
+                port = ctx.port,
+                env_keys = %env_keys,
+                error = %error,
+                "Proxy-delivered credential injection failed"
+            );
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Proxy-delivered credential {} injection failed for {}:{}: {}",
+                        env_keys, ctx.host, ctx.port, error
+                    ))
+                    .build()
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Resolve every matching proxy-delivered binding and build the header.
+///
+/// Aliases of one credential resolve to the same header and collapse into a
+/// single injection. Distinct headers mean two providers bound the same
+/// endpoint, which the gateway rejects at attach time; the proxy fails closed
+/// rather than choosing one. Returns the header name and the rewritten request.
+fn inject_proxy_delivered_header(
+    raw_header: &[u8],
+    ctx: &L7EvalContext,
+    bindings: &[ProxyDeliveredCredential],
+) -> Result<(String, Vec<u8>)> {
     let resolver = ctx
         .secret_resolver
         .as_deref()
-        .ok_or_else(|| miette!("proxy-delivered credential unavailable for {provider_key}"))?;
-    let value = credential
-        .env_vars
-        .iter()
-        .find_map(|key| {
-            resolver
-                .resolve_current_env_key_checked(key, "proxy-delivered credential")
-                .transpose()
-        })
-        .transpose()?
-        .ok_or_else(|| miette!("proxy-delivered credential unavailable for {provider_key}"))?;
+        .ok_or_else(|| miette!("proxy-delivered credential resolver unavailable"))?;
+    let mut header: Option<(String, String)> = None;
+    for binding in bindings {
+        let value = resolver
+            .resolve_current_env_key_checked(&binding.env_key, "proxy-delivered credential")
+            .map_err(|error| miette!("proxy-delivered credential {}: {error}", binding.env_key))?
+            .ok_or_else(|| {
+                miette!(
+                    "proxy-delivered credential {} is unavailable in the current provider revision",
+                    binding.env_key
+                )
+            })?;
+        let candidate = injected_credential_header(
+            &binding.auth_style,
+            &binding.header_name,
+            value,
+            "proxy delivery",
+        )?;
+        match &header {
+            None => header = Some(candidate),
+            Some(existing) if *existing == candidate => {}
+            Some(_) => {
+                return Err(miette!(
+                    "multiple proxy-delivered credentials match this endpoint; attach only one matching provider"
+                ));
+            }
+        }
+    }
     let (header_name, header_value) =
-        injected_credential_header(&credential, value, "proxy delivery")?;
-    let raw_header = inject_header(&req.raw_header, &header_name, &header_value)?;
-
-    Ok(L7Request {
-        action: req.action,
-        target: req.target,
-        query_params: req.query_params,
-        raw_header,
-        body_length: req.body_length,
-    })
+        header.ok_or_else(|| miette!("no proxy-delivered credential binding matched"))?;
+    let raw_header = inject_header(raw_header, &header_name, &header_value)?;
+    Ok((header_name, raw_header))
 }
 
 fn ocsf_message_field(value: &str) -> String {
@@ -296,40 +388,63 @@ fn inject_token_grant_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<Vec<u8>> {
-    let (header_name, header_value) =
-        injected_credential_header(credential, access_token, "token grant")?;
+    let (header_name, header_value) = injected_credential_header(
+        &credential.auth_style,
+        &credential.header_name,
+        access_token,
+        "token grant",
+    )?;
     inject_header(raw_header, &header_name, &header_value)
 }
 
+/// Build the outbound header for a runtime-injected credential.
+///
+/// `context` names the caller ("token grant" or "proxy delivery") in error
+/// messages. Values are validated against the placement so a malformed
+/// credential can never produce a malformed or header-injecting request.
 fn injected_credential_header(
-    credential: &ProviderProfileCredential,
-    access_token: &str,
+    auth_style: &str,
+    configured_header_name: &str,
+    value: &str,
     context: &str,
 ) -> Result<(String, String)> {
-    match credential.auth_style.trim().to_ascii_lowercase().as_str() {
+    match auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" => {
-            crate::token_grant::validate_access_token(access_token)?;
-            let header_name = if credential.header_name.trim().is_empty() {
+            validate_bearer_value(value, context)?;
+            let header_name = if configured_header_name.trim().is_empty() {
                 "Authorization"
             } else {
-                credential.header_name.trim()
+                configured_header_name.trim()
             };
             validate_header_name(header_name, context)?;
-            Ok((header_name.to_string(), format!("Bearer {access_token}")))
+            Ok((header_name.to_string(), format!("Bearer {value}")))
         }
         "header" => {
-            let header_name = credential.header_name.trim();
+            let header_name = configured_header_name.trim();
             if header_name.is_empty() {
                 return Err(miette!("{context} auth_style header requires header_name"));
             }
             validate_header_name(header_name, context)?;
-            validate_header_value(access_token, context)?;
-            Ok((header_name.to_string(), access_token.to_string()))
+            validate_header_value(value, context)?;
+            Ok((header_name.to_string(), value.to_string()))
         }
         other => Err(miette!(
             "{context} auth_style '{other}' is not supported; use bearer or header"
         )),
     }
+}
+
+fn validate_bearer_value(value: &str, context: &str) -> Result<()> {
+    if context == "token grant" {
+        // Preserve the historical token grant wording.
+        return crate::token_grant::validate_access_token(value);
+    }
+    if !openshell_core::provider_credentials::is_token68(value) {
+        return Err(miette!(
+            "{context} bearer credential is not a valid token68 value; check the stored provider credential"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_header_value(value: &str, context: &str) -> Result<()> {
@@ -637,7 +752,9 @@ mod tests {
     use super::*;
     use crate::l7::provider::{BodyLength, L7Request};
     use crate::l7::token_grant_injection::test_support::TokenGrantTestFixture;
-    use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
+    use openshell_core::proto::{
+        ProviderCredentialDelivery, StaticCredentialBinding, StaticCredentialEndpointBinding,
+    };
     use openshell_core::provider_credentials::ProviderCredentialState;
 
     fn credential(auth_style: &str, header_name: &str) -> ProviderProfileCredential {
@@ -815,12 +932,9 @@ mod tests {
     #[test]
     fn token_grant_header_rejects_framing_and_connection_headers() {
         for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
-            let err = injected_credential_header(
-                &credential("header", header_name),
-                "grant-token",
-                "token grant",
-            )
-            .expect_err("framing header override should be rejected");
+            let err =
+                injected_credential_header("header", header_name, "grant-token", "token grant")
+                    .expect_err("framing header override should be rejected");
             assert_eq!(
                 err.to_string(),
                 "token grant header_name may not override HTTP framing or connection headers"
@@ -831,7 +945,8 @@ mod tests {
     #[test]
     fn proxy_delivery_named_header_accepts_safe_non_token_value() {
         let header = injected_credential_header(
-            &credential("header", "x-api-key"),
+            "header",
+            "x-api-key",
             "key with spaces = allowed",
             "proxy delivery",
         )
@@ -845,7 +960,8 @@ mod tests {
         );
 
         let error = injected_credential_header(
-            &credential("header", "x-api-key"),
+            "header",
+            "x-api-key",
             "safe\r\ninjected: value",
             "proxy delivery",
         )
@@ -853,6 +969,23 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "proxy delivery credential contains invalid HTTP header value characters"
+        );
+    }
+
+    #[test]
+    fn proxy_delivery_bearer_value_error_names_the_stored_credential() {
+        let error = injected_credential_header("bearer", "", "has space", "proxy delivery")
+            .expect_err("non-token68 bearer value must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "proxy delivery bearer credential is not a valid token68 value; check the stored provider credential"
+        );
+
+        let error = injected_credential_header("bearer", "", "has space", "token grant")
+            .expect_err("token grant keeps its own wording");
+        assert_eq!(
+            error.to_string(),
+            "token grant returned a malformed access token"
         );
     }
 
@@ -900,65 +1033,248 @@ mod tests {
         );
     }
 
-    #[test]
-    fn proxy_delivery_replaces_header_without_changing_body() {
-        let dynamic_credentials =
-            Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
-                "api.example.com\t443\t/v1/**\tprovider:api_key".to_string(),
-                ProviderProfileCredential {
-                    name: "api_key".to_string(),
-                    env_vars: vec!["API_KEY".to_string()],
-                    auth_style: "bearer".to_string(),
-                    delivery: ProviderCredentialDelivery::Proxy as i32,
-                    ..Default::default()
-                },
-            )])));
-        let state = ProviderCredentialState::from_bound_environment(
+    /// A proxy-delivered binding for `env_key` at `api.example.com:443/v1/**`.
+    fn proxy_binding(
+        identity: &str,
+        auth_style: &str,
+        header_name: &str,
+    ) -> StaticCredentialBinding {
+        StaticCredentialBinding {
+            endpoints: vec![StaticCredentialEndpointBinding {
+                host: "api.example.com".to_string(),
+                port: 443,
+                path: "/v1/**".to_string(),
+            }],
+            credential_identity: identity.to_string(),
+            workload_credential_handle: String::new(),
+            delivery: ProviderCredentialDelivery::Proxy as i32,
+            auth_style: auth_style.to_string(),
+            header_name: header_name.to_string(),
+        }
+    }
+
+    fn proxy_state(
+        env: &[(&str, &str)],
+        bindings: Vec<(&str, StaticCredentialBinding)>,
+    ) -> ProviderCredentialState {
+        ProviderCredentialState::from_bound_environment(
             7,
-            std::collections::HashMap::from([("API_KEY".to_string(), "real-secret".to_string())]),
+            env.iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
-            std::collections::HashMap::from([(
-                "API_KEY".to_string(),
-                StaticCredentialBinding {
-                    endpoints: vec![StaticCredentialEndpointBinding {
-                        host: "api.example.com".to_string(),
-                        port: 443,
-                        path: "/v1/**".to_string(),
-                    }],
-                    credential_identity: "provider:API_KEY".to_string(),
-                    workload_credential_handle: String::new(),
-                    delivery: ProviderCredentialDelivery::Proxy as i32,
-                },
-            )]),
+            bindings
+                .into_iter()
+                .map(|(key, binding)| (key.to_string(), binding))
+                .collect(),
             Vec::new(),
         )
-        .expect("valid provider state");
-        let ctx = L7EvalContext {
+        .expect("valid provider state")
+    }
+
+    fn proxy_ctx(state: &ProviderCredentialState, request_path: &str) -> L7EvalContext {
+        L7EvalContext {
             host: "api.example.com".to_string(),
             port: 443,
-            secret_resolver: state.resolver_for_endpoint("api.example.com", 443, "/v1/chat"),
-            provider_credentials: Some(state),
+            secret_resolver: state.resolver_for_endpoint("api.example.com", 443, request_path),
+            provider_credentials: Some(state.clone()),
             provider_credential_revision: Some(7),
-            dynamic_credentials: Some(dynamic_credentials),
             ..Default::default()
-        };
-        let body = br#"{"messages":[{"content":"ordinary environment output"}]}"#;
-        let mut raw_header = b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell-managed\r\n\r\n".to_vec();
-        raw_header.extend_from_slice(body);
-        let request = L7Request {
+        }
+    }
+
+    fn proxy_request(target: &str, raw_header: &[u8], body: &[u8]) -> L7Request {
+        let mut raw = raw_header.to_vec();
+        raw.extend_from_slice(body);
+        L7Request {
             action: "POST".to_string(),
-            target: "/v1/chat".to_string(),
+            target: target.to_string(),
             query_params: std::collections::HashMap::new(),
-            raw_header,
+            raw_header: raw,
             body_length: BodyLength::ContentLength(body.len() as u64),
-        };
+        }
+    }
+
+    #[test]
+    fn proxy_delivery_replaces_header_without_changing_body() {
+        let state = proxy_state(
+            &[("API_KEY", "real-secret")],
+            vec![("API_KEY", proxy_binding("provider:API_KEY", "bearer", ""))],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let body = br#"{"messages":[{"content":"ordinary environment output"}]}"#;
+        let request = proxy_request(
+            "/v1/chat",
+            b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell-managed\r\n\r\n",
+            body,
+        );
 
         let injected = inject_static_if_needed(request, &ctx).expect("credential injection");
         let text = String::from_utf8(injected.raw_header).expect("HTTP request is UTF-8");
         assert!(text.contains("Authorization: Bearer real-secret\r\n"));
         assert!(!text.contains("openshell-managed"));
+        assert_eq!(text.matches("Authorization:").count(), 1);
         assert!(text.ends_with(std::str::from_utf8(body).expect("body is UTF-8")));
+    }
+
+    #[test]
+    fn proxy_delivery_named_header_is_added_when_absent() {
+        let state = proxy_state(
+            &[("API_KEY", "key with spaces")],
+            vec![(
+                "API_KEY",
+                proxy_binding("provider:API_KEY", "header", "x-api-key"),
+            )],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let request = proxy_request(
+            "/v1/chat",
+            b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            b"{}",
+        );
+
+        let injected = inject_static_if_needed(request, &ctx).expect("credential injection");
+        let text = String::from_utf8(injected.raw_header).expect("HTTP request is UTF-8");
+        assert!(text.contains("x-api-key: key with spaces\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\n{}"), "{text}");
+    }
+
+    #[test]
+    fn proxy_delivery_passes_through_when_no_binding_matches() {
+        let state = proxy_state(
+            &[("API_KEY", "real-secret")],
+            vec![("API_KEY", proxy_binding("provider:API_KEY", "bearer", ""))],
+        );
+        let ctx = proxy_ctx(&state, "/v2/other");
+        let raw = b"POST /v2/other HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer public\r\n\r\n";
+        let request = proxy_request("/v2/other", raw, b"");
+
+        let passed = inject_static_if_needed(request, &ctx).expect("no injection needed");
+        assert_eq!(passed.raw_header, raw.to_vec());
+
+        // Environment-delivered bindings never trigger injection.
+        let mut environment_binding = proxy_binding("provider:API_KEY", "bearer", "");
+        environment_binding.delivery = ProviderCredentialDelivery::Environment as i32;
+        let state = proxy_state(
+            &[("API_KEY", "real-secret")],
+            vec![("API_KEY", environment_binding)],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let raw = b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer public\r\n\r\n";
+        let passed = inject_static_if_needed(proxy_request("/v1/chat", raw, b""), &ctx)
+            .expect("environment delivery is untouched");
+        assert_eq!(passed.raw_header, raw.to_vec());
+    }
+
+    #[test]
+    fn proxy_delivery_collapses_aliases_and_rejects_competing_providers() {
+        let state = proxy_state(
+            &[("API_KEY", "real-secret"), ("API_KEY_ALIAS", "real-secret")],
+            vec![
+                ("API_KEY", proxy_binding("provider:API_KEY", "bearer", "")),
+                (
+                    "API_KEY_ALIAS",
+                    proxy_binding("provider:API_KEY_ALIAS", "bearer", ""),
+                ),
+            ],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let injected = inject_static_if_needed(
+            proxy_request(
+                "/v1/chat",
+                b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                b"",
+            ),
+            &ctx,
+        )
+        .expect("aliases resolve to one header");
+        let text = String::from_utf8(injected.raw_header).expect("UTF-8");
+        assert_eq!(
+            text.matches("Authorization: Bearer real-secret\r\n")
+                .count(),
+            1
+        );
+
+        let state = proxy_state(
+            &[("A_KEY", "secret-a"), ("B_KEY", "secret-b")],
+            vec![
+                ("A_KEY", proxy_binding("provider-a:A_KEY", "bearer", "")),
+                ("B_KEY", proxy_binding("provider-b:B_KEY", "bearer", "")),
+            ],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let error = inject_static_if_needed(
+            proxy_request(
+                "/v1/chat",
+                b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                b"",
+            ),
+            &ctx,
+        )
+        .expect_err("two providers must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("attach only one matching provider"),
+            "{message}"
+        );
+        assert!(!message.contains("secret-a") && !message.contains("secret-b"));
+    }
+
+    #[test]
+    fn proxy_delivery_fails_closed_without_resolver_or_after_revocation() {
+        let state = proxy_state(
+            &[("API_KEY", "real-secret")],
+            vec![("API_KEY", proxy_binding("provider:API_KEY", "bearer", ""))],
+        );
+        let mut ctx = proxy_ctx(&state, "/v1/chat");
+        ctx.secret_resolver = None;
+        let error = inject_static_if_needed(
+            proxy_request(
+                "/v1/chat",
+                b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                b"",
+            ),
+            &ctx,
+        )
+        .expect_err("missing resolver must not forward unauthenticated");
+        assert!(error.to_string().contains("resolver unavailable"));
+
+        // Revocation clears the live bindings, so a request re-scoped after
+        // revocation has nothing to inject and passes through unchanged. The
+        // relay paths re-scope immediately before injection and guard the
+        // revision, so a stale pre-revocation resolver never reaches this call.
+        state.revoke_static_provider_environment(8);
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        assert!(ctx.secret_resolver.is_none());
+        let raw = b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer public\r\n\r\n";
+        let passed = inject_static_if_needed(proxy_request("/v1/chat", raw, b""), &ctx)
+            .expect("revoked bindings leave the request untouched");
+        assert_eq!(passed.raw_header, raw.to_vec());
+    }
+
+    #[test]
+    fn proxy_delivery_rejects_bearer_values_that_are_not_token68() {
+        let state = proxy_state(
+            &[("API_KEY", "has space")],
+            vec![("API_KEY", proxy_binding("provider:API_KEY", "bearer", ""))],
+        );
+        let ctx = proxy_ctx(&state, "/v1/chat");
+        let error = inject_static_if_needed(
+            proxy_request(
+                "/v1/chat",
+                b"POST /v1/chat HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+                b"",
+            ),
+            &ctx,
+        )
+        .expect_err("malformed bearer value must not be injected");
+        let message = error.to_string();
+        assert!(
+            message.contains("proxy delivery bearer credential"),
+            "{message}"
+        );
+        assert!(!message.contains("has space"), "{message}");
     }
 
     #[tokio::test]

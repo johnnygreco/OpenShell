@@ -429,7 +429,15 @@ binaries:
 
 This minimal profile keeps `MODEL_API_KEY` and its OpenShell placeholder out of the sandbox. The application may send any public placeholder value in `Authorization`; OpenShell replaces the complete header before forwarding the allowed request.
 
+Proxy delivery changes where the credential lives, not who can use it. Any sandbox process that reaches a bound endpoint through the inspected proxy sends an authenticated request, exactly as it could with an environment placeholder. What changes is that the workload never holds credential-shaped material, and network policy and middleware inspect the request before OpenShell authenticates it.
+
 The initial proxy-delivery implementation supports one proxy-delivered static credential per profile. That credential may list multiple `env_vars` aliases. A profile using proxy delivery cannot also declare a `token_grant` credential.
+
+Proxy-delivered credential values are validated when you create or update the provider. A `bearer` value must use the RFC 7235 `token68` character set: letters, digits, `-`, `.`, `_`, `~`, `+`, `/`, and trailing `=` padding. A named `header` value may contain any printable characters but no control characters. The proxy validates the value again immediately before injection.
+
+Two attached providers cannot bind proxy-delivered credentials to overlapping host and path selectors on the same port, even when one selector is more specific. This is stricter than the token grant rule, which lets the more specific selector win. Because the application sends no credential, the proxy cannot verify which provider the request intended, so OpenShell rejects the attach, profile import, or profile update instead of choosing one at request time.
+
+When a bound request cannot be authenticated, for example because the provider environment was revoked mid-request, the proxy returns `502 Bad Gateway` with error code `provider_authentication_failed` and never forwards the request. Every successful and failed injection emits an OCSF HTTP activity event that names the credential environment variable and target endpoint without the credential value. Requests to endpoints outside the binding, or through a policy endpoint that uses `tls: skip`, are forwarded with whatever header the application sent and the upstream rejects them.
 
 ```yaml
 id: custom-model-api

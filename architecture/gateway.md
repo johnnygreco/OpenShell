@@ -177,8 +177,9 @@ their profile payloads.
 
 Each logical gateway request captures the selected sources into one validated,
 immutable effective catalog before deriving provider behavior. Policy layers,
-credential scope, injected environment material, dynamic token grants, and
-provider-environment revisions use that same catalog. Each configured source is
+credential scope, injected environment material, dynamic token grants,
+proxy-delivered static credential bindings, and provider-environment revisions
+use that same catalog. Each configured source is
 therefore fetched at most once per request, and a source revision change becomes
 visible on the next request instead of partway through the current request. The
 capture emits debug diagnostics with the combined catalog revision, source fetch
@@ -479,12 +480,23 @@ target so an edited export cannot overwrite a different profile. Database
 migrations backfill existing rows with version 1.
 
 Provider profile imports, updates, and deletes hold the sandbox synchronization
-guard while checking attached-sandbox dynamic token grant ambiguity or in-use
-state and writing the profile record. Sandbox creation with initial providers and
-sandbox provider attach/detach use the same guard, so one gateway process cannot
-interleave a profile mutation with a sandbox provider-set mutation that would
-leave an ambiguous final dynamic-token state or a deleted custom profile that is
-still referenced by a sandbox.
+guard while checking attached-sandbox runtime-injected credential ambiguity or
+in-use state and writing the profile record. Runtime-injected credentials are
+dynamic token grants and proxy-delivered static credentials. Token grants on
+overlapping selectors are ambiguous only at equal specificity; proxy-delivered
+credentials are ambiguous on any overlap of the same port, because the workload
+sends no credential the proxy could use to disambiguate. Sandbox creation with
+initial providers and sandbox provider attach/detach use the same guard, so one
+gateway process cannot interleave a profile mutation with a sandbox provider-set
+mutation that would leave an ambiguous final runtime-credential state or a
+deleted custom profile that is still referenced by a sandbox.
+
+Proxy-delivered credential values are validated against their declared
+placement when a provider is created or updated: `bearer` values must be
+`token68` and named `header` values must not contain control characters. The
+gateway copies the delivery mode, auth style, and header name onto the static
+credential binding it sends to the sandbox so the supervisor never needs profile
+metadata to build the header.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The

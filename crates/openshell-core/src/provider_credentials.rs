@@ -22,6 +22,80 @@ pub struct ProviderCredentialSnapshot {
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
 }
 
+/// Placement metadata for a static credential that opted into proxy delivery.
+///
+/// The sandbox proxy uses this to build the complete outbound header from the
+/// endpoint-bound binding alone, without consulting profile metadata.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ProxyDeliveredCredential {
+    pub env_key: String,
+    pub auth_style: String,
+    pub header_name: String,
+}
+
+/// Validate a static credential value against the header placement its
+/// profile declares.
+///
+/// Proxy-delivered credentials are written into an HTTP header verbatim, so a
+/// value the proxy would reject at request time must be rejected when the
+/// provider is created or updated instead.
+pub fn validate_proxy_delivered_credential_value(
+    auth_style: &str,
+    value: &str,
+) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("credential value must not be empty".to_string());
+    }
+    match auth_style.trim().to_ascii_lowercase().as_str() {
+        "" | "bearer" => {
+            if !is_token68(value) {
+                return Err(
+                    "bearer credential values may only contain letters, digits, '-', '.', '_', '~', '+', '/', and trailing '=' padding"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        "header" => {
+            if value
+                .bytes()
+                .any(|byte| (byte < b' ' && byte != b'\t') || byte == 0x7f)
+            {
+                return Err(
+                    "header credential values must not contain control characters".to_string(),
+                );
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "proxy delivery does not support auth_style '{other}'; use bearer or header"
+        )),
+    }
+}
+
+/// Whether `token` is a non-empty RFC 7235 `token68` value, the character set
+/// permitted in a `Bearer` authorization credential.
+#[must_use]
+pub fn is_token68(token: &str) -> bool {
+    let mut padding_started = false;
+    let mut saw_value = false;
+    for byte in token.bytes() {
+        if byte == b'=' {
+            padding_started = true;
+            continue;
+        }
+        if padding_started || !is_token68_value_byte(byte) {
+            return false;
+        }
+        saw_value = true;
+    }
+    saw_value
+}
+
+fn is_token68_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
 #[derive(Debug)]
 struct ProviderCredentialStateInner {
     current: Arc<ProviderCredentialSnapshot>,
@@ -47,6 +121,8 @@ struct CompiledStaticCredentialBinding {
     credential_identity: String,
     workload_credential_handle: String,
     delivery: crate::proto::ProviderCredentialDelivery,
+    auth_style: String,
+    header_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -271,31 +347,17 @@ impl ProviderCredentialState {
         port: u16,
         path: &str,
     ) -> (Option<Arc<SecretResolver>>, u64) {
-        let request_path = path.split_once('?').map_or(path, |(path, _)| path);
-        let request_path = crate::secrets::redact_target_for_policy(request_path);
-        let normalized_host = host.to_ascii_lowercase();
-        let host_labels = normalized_host.split('.').collect::<Vec<_>>();
         let inner = self
             .inner
             .read()
             .expect("provider credential state poisoned");
         let revision = inner.current.revision;
-        let Ok(request_path) = request_path else {
+        let Some(allowed) = allowed_static_credential_keys(&inner, host, port, path) else {
             // Binding authorization must not depend on real credential
             // material. Malformed placeholder syntax cannot be normalized
             // safely, so expose no endpoint-scoped resolver.
             return (None, revision);
         };
-        let allowed: HashSet<String> = inner
-            .static_credential_bindings
-            .iter()
-            .filter(|(_, binding)| {
-                binding.endpoints.iter().any(|endpoint| {
-                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
-                })
-            })
-            .map(|(key, _)| key.clone())
-            .collect();
         let resolver = inner.combined_resolver.as_ref().map(|resolver| {
             let revision_fallback_allowed_revisions = inner
                 .static_credential_identity_epochs
@@ -316,6 +378,43 @@ impl ProviderCredentialState {
             ))
         });
         (resolver, revision)
+    }
+
+    /// Proxy-delivered static credentials whose bindings authorize this
+    /// endpoint, sorted by environment key.
+    ///
+    /// The proxy injects these into the outbound request instead of exposing
+    /// a placeholder to the workload. An unparseable request path yields no
+    /// credentials for the same reason it yields no endpoint-scoped resolver.
+    #[must_use]
+    pub fn proxy_delivered_credentials_for_endpoint(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> Vec<ProxyDeliveredCredential> {
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let Some(allowed) = allowed_static_credential_keys(&inner, host, port, path) else {
+            return Vec::new();
+        };
+        let mut credentials = inner
+            .static_credential_bindings
+            .iter()
+            .filter(|(key, binding)| {
+                allowed.contains(*key)
+                    && binding.delivery == crate::proto::ProviderCredentialDelivery::Proxy
+            })
+            .map(|(key, binding)| ProxyDeliveredCredential {
+                env_key: key.clone(),
+                auth_style: binding.auth_style.clone(),
+                header_name: binding.header_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        credentials.sort();
+        credentials
     }
 
     #[must_use]
@@ -689,6 +788,8 @@ fn compile_static_credential_bindings(
                     workload_credential_handle: binding.workload_credential_handle,
                     delivery: crate::proto::ProviderCredentialDelivery::try_from(binding.delivery)
                         .unwrap_or(crate::proto::ProviderCredentialDelivery::Environment),
+                    auth_style: binding.auth_style,
+                    header_name: binding.header_name,
                 },
             ))
         })
@@ -786,6 +887,35 @@ fn binding_error(message: &str) -> StaticCredentialBindingError {
     }
 }
 
+/// Static credential keys whose bindings authorize `host:port path`.
+///
+/// Returns `None` when the request path cannot be normalized. Binding
+/// authorization must not depend on real credential material, so malformed
+/// placeholder syntax in the path authorizes nothing.
+fn allowed_static_credential_keys(
+    inner: &ProviderCredentialStateInner,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Option<HashSet<String>> {
+    let request_path = path.split_once('?').map_or(path, |(path, _)| path);
+    let request_path = crate::secrets::redact_target_for_policy(request_path).ok()?;
+    let normalized_host = host.to_ascii_lowercase();
+    let host_labels = normalized_host.split('.').collect::<Vec<_>>();
+    Some(
+        inner
+            .static_credential_bindings
+            .iter()
+            .filter(|(_, binding)| {
+                binding.endpoints.iter().any(|endpoint| {
+                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
+                })
+            })
+            .map(|(key, _)| key.clone())
+            .collect(),
+    )
+}
+
 fn static_credential_endpoint_matches(
     endpoint: &CompiledStaticCredentialEndpointBinding,
     host_labels: &[&str],
@@ -825,6 +955,8 @@ mod tests {
             credential_identity: "provider-a:API_KEY".to_string(),
             workload_credential_handle: String::new(),
             delivery: 0,
+            auth_style: String::new(),
+            header_name: String::new(),
         }
     }
 
@@ -982,6 +1114,97 @@ mod tests {
                 .resolve_current_env_key_checked("API_KEY", "test")
                 .expect("authorized endpoint"),
             Some("secret")
+        );
+    }
+
+    #[test]
+    fn proxy_delivered_credentials_are_listed_only_for_bound_endpoints() {
+        let mut proxy_binding = binding("api.example.com", 443, "/v1/**");
+        proxy_binding.delivery = crate::proto::ProviderCredentialDelivery::Proxy as i32;
+        proxy_binding.auth_style = "header".to_string();
+        proxy_binding.header_name = "x-api-key".to_string();
+        let mut alias_binding = proxy_binding.clone();
+        alias_binding.credential_identity = "provider-a:API_KEY_ALIAS".to_string();
+        let environment_binding = binding("api.example.com", 443, "/v1/**");
+        let state = ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([
+                ("API_KEY".to_string(), "secret".to_string()),
+                ("API_KEY_ALIAS".to_string(), "secret".to_string()),
+                ("OTHER_KEY".to_string(), "other".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("API_KEY".to_string(), proxy_binding),
+                ("API_KEY_ALIAS".to_string(), alias_binding),
+                ("OTHER_KEY".to_string(), environment_binding),
+            ]),
+            Vec::new(),
+        )
+        .expect("valid bindings");
+
+        let credentials =
+            state.proxy_delivered_credentials_for_endpoint("API.example.com", 443, "/v1/chat?x=1");
+        assert_eq!(
+            credentials,
+            vec![
+                ProxyDeliveredCredential {
+                    env_key: "API_KEY".to_string(),
+                    auth_style: "header".to_string(),
+                    header_name: "x-api-key".to_string(),
+                },
+                ProxyDeliveredCredential {
+                    env_key: "API_KEY_ALIAS".to_string(),
+                    auth_style: "header".to_string(),
+                    header_name: "x-api-key".to_string(),
+                },
+            ]
+        );
+        assert!(
+            state
+                .proxy_delivered_credentials_for_endpoint("api.example.com", 443, "/v2/chat")
+                .is_empty()
+        );
+        assert!(
+            state
+                .proxy_delivered_credentials_for_endpoint("api.example.com", 8443, "/v1/chat")
+                .is_empty()
+        );
+        assert!(
+            state
+                .proxy_delivered_credentials_for_endpoint("other.example.com", 443, "/v1/chat")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn proxy_delivered_credential_values_are_validated_per_auth_style() {
+        validate_proxy_delivered_credential_value("bearer", "sk-live_abc.DEF~123+/==")
+            .expect("token68 bearer value");
+        validate_proxy_delivered_credential_value("", "plain-token").expect("default is bearer");
+        validate_proxy_delivered_credential_value("header", "key with spaces = allowed")
+            .expect("header values may contain spaces");
+
+        assert!(
+            validate_proxy_delivered_credential_value("bearer", "has space")
+                .expect_err("space is not token68")
+                .contains("bearer credential values")
+        );
+        assert!(
+            validate_proxy_delivered_credential_value("bearer", "")
+                .expect_err("empty value")
+                .contains("must not be empty")
+        );
+        assert!(
+            validate_proxy_delivered_credential_value("header", "safe\r\ninjected: value")
+                .expect_err("CRLF is a control sequence")
+                .contains("control characters")
+        );
+        assert!(
+            validate_proxy_delivered_credential_value("query", "value")
+                .expect_err("query placement is not proxy deliverable")
+                .contains("use bearer or header")
         );
     }
 
