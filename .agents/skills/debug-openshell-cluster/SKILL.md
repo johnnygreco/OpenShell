@@ -116,8 +116,7 @@ an agent-conversation binding, uses `fail_closed`, selects one exact provider
 host without exclusions, and that the host resolves to one admitted network
 endpoint. The loopback bridge is available only in combined topology and is
 started when the sandbox starts with an agent binding. Check the sandbox
-environment for `OPENSHELL_AGENT_CONVERSATION_URL`; managed Pi may use the
-compatibility alias `OPENSHELL_PI_CONVERSATION_URL`. A generation mismatch after
+environment for `OPENSHELL_AGENT_CONVERSATION_URL`. A generation mismatch after
 a rejected or fail-closed policy reload intentionally returns admission
 unavailable instead of evaluating against stale middleware state.
 

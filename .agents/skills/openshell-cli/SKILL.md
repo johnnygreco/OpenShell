@@ -449,9 +449,9 @@ An operator service can also advertise `AGENT_CONVERSATION/AGENT_CONTEXT`.
 Agent admission requires `fail_closed`, exactly one configured agent binding,
 and one exact provider host that resolves to one admitted network endpoint. The
 supervisor exposes `OPENSHELL_AGENT_CONVERSATION_URL` in combined topology and
-keeps `OPENSHELL_PI_CONVERSATION_URL` as a compatibility alias. Adding the first
-agent binding to a running sandbox requires recreating the sandbox so the
-bridge listener and environment are installed.
+uses that generic variable for every harness. Adding the first agent binding to
+a running sandbox requires recreating the sandbox so OpenShell installs the
+bridge listener and environment.
 
 ### Step 5: Push the updated policy
 
