@@ -92,6 +92,11 @@ async fn select_agent_bridge(
     runner: &ChainRunner,
     policy: &openshell_core::proto::SandboxPolicy,
 ) -> Result<Option<agent_bridge::BridgeSelection>> {
+    let require_caller_token = require_agent_bridge_caller_token(
+        std::env::var(openshell_supervisor_process::REQUIRE_CALLER_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    )?;
     let bindings = runner.agent_conversation_bindings().await?;
     let mut matches = policy.network_middlewares.iter().filter(|(_, config)| {
         bindings
@@ -124,6 +129,7 @@ async fn select_agent_bridge(
     }
     let provider_host = &endpoints.include[0];
     let (provider_scheme, provider_port) = exact_provider_endpoint(policy, provider_host)?;
+    let middleware_config = config.config.clone().unwrap_or_default();
     let advertised = bindings
         .into_iter()
         .filter(|binding| binding.middleware_name == config.middleware)
@@ -144,8 +150,20 @@ async fn select_agent_bridge(
         provider_scheme,
         provider_host: provider_host.clone(),
         provider_port,
-        middleware_config: config.config.clone().unwrap_or_default(),
+        middleware_config,
+        require_caller_token,
     }))
+}
+
+fn require_agent_bridge_caller_token(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(miette::miette!(
+            "{} must be 'true' or 'false'",
+            openshell_supervisor_process::REQUIRE_CALLER_TOKEN_ENV
+        )),
+    }
 }
 
 fn exact_provider_endpoint(
@@ -658,6 +676,9 @@ pub async fn run_sandbox(
         }
         _ => None,
     };
+    let admission_tokens = agent_bridge
+        .as_ref()
+        .map(|_| openshell_supervisor_process::AdmissionTokenRegistry::default());
     let agent_bridge_runtime = if let Some(selection) = agent_bridge {
         if sidecar_network_enforcement {
             return Err(miette::miette!(
@@ -702,6 +723,9 @@ pub async fn run_sandbox(
             sandbox_id.clone().unwrap_or_default(),
             sandbox_name_for_agg.clone().unwrap_or_default(),
             workspace_rx.clone(),
+            admission_tokens
+                .clone()
+                .expect("selected agent bridge requires caller token registry"),
         );
         provider_env.insert(
             agent_bridge::BRIDGE_URL_ENV.into(),
@@ -1106,6 +1130,7 @@ pub async fn run_sandbox(
             main_env,
             ca_file_paths,
             agent_proposals.clone(),
+            admission_tokens,
             #[cfg(target_os = "linux")]
             netns.as_ref(),
             #[cfg(target_os = "linux")]
@@ -4736,6 +4761,14 @@ mod tests {
             .ports
             .push(8443);
         assert!(exact_provider_endpoint(&policy, "api.example.com").is_err());
+    }
+
+    #[test]
+    fn agent_bridge_caller_token_defaults_on_and_has_explicit_debug_opt_out() {
+        assert!(require_agent_bridge_caller_token(None).unwrap());
+        assert!(require_agent_bridge_caller_token(Some("true")).unwrap());
+        assert!(!require_agent_bridge_caller_token(Some("false")).unwrap());
+        assert!(require_agent_bridge_caller_token(Some("0")).is_err());
     }
 
     #[test]

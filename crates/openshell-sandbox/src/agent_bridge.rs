@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -38,6 +39,7 @@ pub struct BridgeSelection {
     pub provider_host: String,
     pub provider_port: u32,
     pub middleware_config: prost_types::Struct,
+    pub require_caller_token: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +63,7 @@ struct BridgeState {
     sandbox_id: Arc<str>,
     sandbox_name: Arc<str>,
     workspace: watch::Receiver<String>,
+    caller_tokens: openshell_supervisor_process::AdmissionTokenRegistry,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +107,7 @@ pub fn spawn(
     sandbox_id: String,
     sandbox_name: String,
     workspace: watch::Receiver<String>,
+    caller_tokens: openshell_supervisor_process::AdmissionTokenRegistry,
 ) -> tokio::task::JoinHandle<()> {
     let state = BridgeState {
         engine,
@@ -111,16 +115,58 @@ pub fn spawn(
         sandbox_id: Arc::from(sandbox_id),
         sandbox_name: Arc::from(sandbox_name),
         workspace,
+        caller_tokens,
     };
     tokio::spawn(async move {
         let app = Router::new()
-            .route(BRIDGE_PATH, post(evaluate))
+            .route(
+                BRIDGE_PATH,
+                post(evaluate).route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    authorize_caller,
+                )),
+            )
             .layer(DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
             .with_state(state);
         if let Err(error) = axum::serve(listener, app).await {
             warn!(%error, "agent admission bridge stopped");
         }
     })
+}
+
+async fn authorize_caller(
+    State(state): State<BridgeState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let runtime = state.runtime.borrow().clone();
+    if runtime
+        .selection
+        .as_ref()
+        .is_some_and(|selection| selection.require_caller_token)
+    {
+        let authorized = caller_is_authorized(request.headers(), |token| {
+            state.caller_tokens.contains(token)
+        });
+        if !authorized {
+            return caller_not_authorized();
+        }
+    }
+    next.run(request).await
+}
+
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn caller_is_authorized(
+    headers: &axum::http::HeaderMap,
+    is_registered: impl FnOnce(&str) -> bool,
+) -> bool {
+    bearer_token(headers).is_some_and(|token| !token.is_empty() && is_registered(token))
 }
 
 async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequest>) -> Response {
@@ -296,6 +342,16 @@ fn admission_unavailable() -> Response {
         .into_response()
 }
 
+fn caller_not_authorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(BridgeError {
+            error: "caller_not_authorized",
+        }),
+    )
+        .into_response()
+}
+
 fn selected_binding<'a>(
     selection: &'a BridgeSelection,
     input: &BridgeRequest,
@@ -397,6 +453,22 @@ mod tests {
         assert!(selected_binding(&selection(1), &request("sdk-v1", 2)).is_none());
     }
 
+    #[test]
+    fn caller_token_header_requires_exact_bearer_scheme() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(bearer_token(&headers), None);
+
+        headers.insert(AUTHORIZATION, "Basic token".parse().unwrap());
+        assert_eq!(bearer_token(&headers), None);
+        assert!(!caller_is_authorized(&headers, |_| true));
+
+        headers.insert(AUTHORIZATION, "Bearer token".parse().unwrap());
+        assert_eq!(bearer_token(&headers), Some("token"));
+        assert!(caller_is_authorized(&headers, |token| token == "token"));
+        assert!(!caller_is_authorized(&headers, |_| false));
+        assert_eq!(caller_not_authorized().status(), StatusCode::UNAUTHORIZED);
+    }
+
     fn selection(limit: usize) -> BridgeSelection {
         BridgeSelection {
             middleware_name: "operator/guard".into(),
@@ -410,6 +482,7 @@ mod tests {
             provider_host: "api.example.com".into(),
             provider_port: 8443,
             middleware_config: prost_types::Struct::default(),
+            require_caller_token: true,
         }
     }
 
