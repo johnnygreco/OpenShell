@@ -301,6 +301,7 @@ func TestConverterCoversAllProtoFields_ProviderProfileCredential(t *testing.T) {
 		"description":   true,
 		"env_vars":      true,
 		"required":      true,
+		"delivery":      true,
 		"auth_style":    true,
 		"header_name":   true,
 		"query_param":   true,

@@ -35,12 +35,22 @@ type ProviderProfile struct {
 	Scope            string
 }
 
+// CredentialDelivery controls how a static credential reaches the workload.
+type CredentialDelivery string
+
+// CredentialDelivery values.
+const (
+	CredentialDeliveryEnvironment CredentialDelivery = "Environment"
+	CredentialDeliveryProxy       CredentialDelivery = "Proxy"
+)
+
 // ProfileCredential defines a single credential required by a provider profile.
 type ProfileCredential struct {
 	Name         string
 	Description  string
 	EnvVars      []string
 	Required     bool
+	Delivery     CredentialDelivery
 	Secret       bool
 	Refresh      *ProfileCredentialRefresh
 	AuthStyle    string
