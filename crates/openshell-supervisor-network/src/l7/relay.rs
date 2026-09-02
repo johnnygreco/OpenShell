@@ -791,8 +791,6 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -826,8 +824,39 @@ where
             } else {
                 None
             };
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(error) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %error,
+                            "Token grant failed in route-selected L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
+            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_static_if_needed(req_with_auth, ctx)
+                {
+                    Ok(req) => req,
+                    Err(error) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %error,
+                            "Static provider credential injection failed in route-selected L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
             let outcome_result = relay_http_request_with_credential_rejection(
-                &req,
+                &req_with_auth,
                 client,
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
@@ -898,7 +927,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req.query_params,
+                        &req_with_auth.query_params,
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -7947,6 +7976,107 @@ network_policies:
         drop(app);
         drop(upstream);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
+    async fn route_selected_relay_injects_proxy_delivered_credential() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: /v1/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/v1/**"
+      - host: api.example.test
+        port: 443
+        path: /v2/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/v2/**"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let rest = |path: &str| L7EndpointConfig {
+            protocol: L7Protocol::Rest,
+            path: path.into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: false,
+            request_body_credential_rewrite: false,
+            allow_uninspected_credentials: false,
+            provider_credentialed: false,
+            websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
+            signing_region: String::new(),
+        };
+        let configs = vec![rest("/v1/**"), rest("/v2/**")];
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            provider_credentials: Some(proxy_delivered_state(443)),
+            ..Default::default()
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"POST /v1/chat HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer public-value\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let forwarded = read_http_head(&mut upstream, "route-selected request").await;
+        assert!(
+            forwarded.contains("Authorization: Bearer real-secret\r\n"),
+            "{forwarded}"
+        );
+        assert!(!forwarded.contains("public-value"), "{forwarded}");
+        assert_eq!(authorization_header_count(&forwarded), 1, "{forwarded}");
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_http_head(&mut app, "route-selected response").await;
+        assert!(response.contains("204 No Content"), "{response}");
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
