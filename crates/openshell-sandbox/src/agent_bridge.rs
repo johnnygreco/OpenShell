@@ -10,12 +10,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use base64::Engine as _;
 use openshell_core::proto::{
     AgentConversationEvaluation, AgentConversationResult, AgentConversationTarget, Decision,
     RequestContext, SupervisorMiddlewarePhase,
 };
 use openshell_supervisor_network::opa::OpaEngine;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -25,11 +26,9 @@ pub const BRIDGE_PATH: &str = "/v1/agent/conversation";
 pub const BRIDGE_URL: &str = "http://127.0.0.1:8193/v1/agent/conversation";
 pub const BRIDGE_URL_ENV: &str = "OPENSHELL_AGENT_CONVERSATION_URL";
 
-// Vec<u8> is encoded as a JSON number array by the existing bridge contract,
-// so its transport envelope can be roughly five times the logical payload.
 const MAX_ADMISSION_BODY_BYTES: usize =
     openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES;
-const MAX_BRIDGE_BODY_BYTES: usize = MAX_ADMISSION_BODY_BYTES * 5 + 64 * 1024;
+const MAX_BRIDGE_BODY_BYTES: usize = MAX_ADMISSION_BODY_BYTES.div_ceil(3) * 4 + 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BridgeSelection {
@@ -74,6 +73,7 @@ struct BridgeRequest {
     session_id: String,
     #[serde(default)]
     submission_id: String,
+    #[serde(rename = "request_body_b64", deserialize_with = "deserialize_base64")]
     request_body: Vec<u8>,
 }
 
@@ -81,6 +81,10 @@ struct BridgeRequest {
 struct BridgeResponse {
     decision: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "replacement_body_b64",
+        serialize_with = "serialize_optional_base64"
+    )]
     replacement_body: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     handle: Option<String>,
@@ -179,6 +183,25 @@ async fn evaluate(State(state): State<BridgeState>, Json(input): Json<BridgeRequ
         Ok(result) => Json(result).into_response(),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(BridgeError { error })).into_response(),
     }
+}
+
+fn deserialize_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = String::deserialize(deserializer)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(D::Error::custom)
+}
+
+fn serialize_optional_base64<S>(body: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    body.as_ref()
+        .map(|body| base64::engine::general_purpose::STANDARD.encode(body))
+        .serialize(serializer)
 }
 
 fn build_evaluation(
@@ -329,6 +352,38 @@ mod tests {
     }
 
     #[test]
+    fn admission_request_json_requires_the_base64_field() {
+        let input: BridgeRequest = serde_json::from_value(serde_json::json!({
+            "harness_version": "sdk-v1",
+            "hook": "user_input",
+            "schema_version": "example.input.v1",
+            "request_body_b64": "eHg="
+        }))
+        .unwrap();
+        assert_eq!(input.request_body, b"xx");
+
+        assert!(
+            serde_json::from_value::<BridgeRequest>(serde_json::json!({
+                "harness_version": "sdk-v1",
+                "hook": "user_input",
+                "schema_version": "example.input.v1",
+                "request_body_b64": "not base64"
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<BridgeRequest>(serde_json::json!({
+                "harness_version": "sdk-v1",
+                "hook": "user_input",
+                "schema_version": "example.input.v1",
+                "request_body": [120]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn admission_request_enforces_the_logical_body_limit() {
         let max_selection = selection(MAX_ADMISSION_BODY_BYTES);
         assert!(selected_binding(&max_selection, &request("sdk-v1", 0)).is_none());
@@ -403,6 +458,10 @@ mod tests {
         )
         .expect("allow");
         assert_eq!(allow.decision, "allow");
+        assert_eq!(
+            serde_json::to_value(&allow).unwrap()["replacement_body_b64"],
+            "cmVkYWN0ZWQ="
+        );
         let handle = allow.handle.expect("handle");
         assert_ne!(handle.as_bytes(), b"receipt");
         let request = openshell_supervisor_middleware::AgentAdmissionRequest {
@@ -426,6 +485,23 @@ mod tests {
             Some(b"receipt".to_vec())
         );
         assert_eq!(allow.replacement_body, Some(b"redacted".to_vec()));
+
+        let empty_replacement = bridge_result(
+            &runner,
+            "sandbox-1",
+            7,
+            &selection,
+            AgentConversationResult {
+                decision: Decision::Allow as i32,
+                has_replacement_body: true,
+                ..Default::default()
+            },
+        )
+        .expect("empty replacement");
+        assert_eq!(
+            serde_json::to_value(&empty_replacement).unwrap()["replacement_body_b64"],
+            ""
+        );
 
         let deny = bridge_result(
             &runner,

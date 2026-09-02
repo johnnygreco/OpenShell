@@ -191,7 +191,9 @@ replacement. Provider egress strips and resolves that handle, exposing the
 attestation only to the matching middleware stage. Handles are scoped to the
 sandbox, middleware, provider target, and runtime generation and remain
 retryable only for their bounded lifetime, so partial policy or registry reloads
-cannot mix admission and egress state.
+cannot mix admission and egress state. An allowed admission result without an
+attestation returns no handle; append-time checks need only a decision, while an
+attested provider-context check supplies the handle used at provider egress.
 
 The supervisor installs policy and middleware registry changes as one runtime
 generation and preserves the last-known-good generation if preparation fails.

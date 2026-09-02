@@ -17,15 +17,20 @@ the harness, hook, and schema identifiers. The selected policy config must use
 scheme and port from the corresponding admitted network endpoint. The bridge
 sets `OPENSHELL_AGENT_CONVERSATION_URL`, stamps sandbox and provider identity,
 and returns only the structured decision, optional replacement, and opaque
-receipt. It shares the policy and middleware registry generation used for
+handle. It shares the policy and middleware registry generation used for
 provider egress, so an incomplete reload makes admission unavailable.
 
 Managed Pi is the first client of this general contract. A Pi extension submits
-a rendered, idle, text-only user prompt before Pi stores it; denied prompts never
-enter chat history, while replacement bodies support redaction. Pi remains
-unaware of OpenShell-specific behavior. Admission bodies are limited to 32 KiB
-and to the advertised binding limit. Images, queued input, retries, compaction,
-and automatic continuations after tool calls remain outside this initial hook.
+each user, tool-result, assistant, summary, extension, and bash message before Pi
+stores it; a denial prevents the original message from entering history, while
+a replacement supports redaction. It separately submits the exact outbound text
+context before provider serialization. The returned handle binds that context
+to the provider request, where middleware checks it again before credentials are
+injected. Queued input, retries, compaction, automatic continuations after tool
+calls, and assistant output therefore pass through these checkpoints. Assistant
+output is admitted at finalization after it has been displayed. Images remain
+unsupported. Logical admission bodies are limited to 4 MiB and to the advertised
+binding limit. Pi remains unaware of OpenShell-specific behavior.
 
 Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
 
@@ -184,7 +189,7 @@ Middleware decisions are enforced regardless of the endpoint's `enforcement` mod
 
 ## Set Payload Limits
 
-Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session. For `AGENT_CONVERSATION`, it is one versioned hook body or replacement; the initial loopback bridge applies an additional 32 KiB limit.
+Every middleware binding declares the largest logical payload or replacement it supports through `max_payload_bytes`. For `HTTP_REQUEST`, that payload is one request body. For `WEBSOCKET_MESSAGE`, it is one complete message rather than the whole session. For `AGENT_CONVERSATION`, it is one versioned hook body or replacement; the loopback bridge applies the 4 MiB platform maximum before the binding-specific limit.
 
 - Built-in middleware uses its OpenShell-defined limit.
 - Each operator-run registration sets one `max_payload_bytes` ceiling. OpenShell uses the smaller of that ceiling and each binding's advertised `max_payload_bytes` capability.
