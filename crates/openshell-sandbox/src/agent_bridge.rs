@@ -24,7 +24,6 @@ pub const BRIDGE_ADDR: &str = "127.0.0.1:8193";
 pub const BRIDGE_PATH: &str = "/v1/agent/conversation";
 pub const BRIDGE_URL: &str = "http://127.0.0.1:8193/v1/agent/conversation";
 pub const BRIDGE_URL_ENV: &str = "OPENSHELL_AGENT_CONVERSATION_URL";
-pub const LEGACY_PI_BRIDGE_URL_ENV: &str = "OPENSHELL_PI_CONVERSATION_URL";
 
 // Vec<u8> is encoded as a JSON number array by the existing bridge contract,
 // so its transport envelope can be roughly five times the logical payload.

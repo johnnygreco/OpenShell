@@ -707,10 +707,6 @@ pub async fn run_sandbox(
             agent_bridge::BRIDGE_URL_ENV.into(),
             agent_bridge::BRIDGE_URL.into(),
         );
-        provider_env.insert(
-            agent_bridge::LEGACY_PI_BRIDGE_URL_ENV.into(),
-            agent_bridge::BRIDGE_URL.into(),
-        );
         info!(
             url = agent_bridge::BRIDGE_URL,
             "agent admission bridge ready"

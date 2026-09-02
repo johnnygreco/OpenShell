@@ -20,9 +20,8 @@ and returns only the structured decision, optional replacement, and opaque
 receipt. It shares the policy and middleware registry generation used for
 provider egress, so an incomplete reload makes admission unavailable.
 
-Managed Pi is the first client of this general contract. For compatibility, the
-supervisor also sets `OPENSHELL_PI_CONVERSATION_URL`. A Pi extension submits a
-rendered, idle, text-only user prompt before Pi stores it; denied prompts never
+Managed Pi is the first client of this general contract. A Pi extension submits
+a rendered, idle, text-only user prompt before Pi stores it; denied prompts never
 enter chat history, while replacement bodies support redaction. Pi remains
 unaware of OpenShell-specific behavior. Admission bodies are limited to 32 KiB
 and to the advertised binding limit. Images, queued input, retries, compaction,
