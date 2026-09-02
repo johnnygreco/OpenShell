@@ -2683,6 +2683,8 @@ network_policies:
                     credential_identity: "provider-a:DISCORD_BOT_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     delivery: 0,
+                    auth_style: String::new(),
+                    header_name: String::new(),
                 },
             )]),
             Vec::new(),

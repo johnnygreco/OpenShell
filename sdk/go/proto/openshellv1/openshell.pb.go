@@ -8689,7 +8689,12 @@ type StaticCredentialBinding struct {
 	// authorization epoch, or endpoint authorization boundary changes.
 	WorkloadCredentialHandle string `protobuf:"bytes,3,opt,name=workload_credential_handle,json=workloadCredentialHandle,proto3" json:"workload_credential_handle,omitempty"`
 	// Delivery mode copied from the provider profile credential declaration.
-	Delivery      ProviderCredentialDelivery `protobuf:"varint,4,opt,name=delivery,proto3,enum=openshell.v1.ProviderCredentialDelivery" json:"delivery,omitempty"`
+	Delivery ProviderCredentialDelivery `protobuf:"varint,4,opt,name=delivery,proto3,enum=openshell.v1.ProviderCredentialDelivery" json:"delivery,omitempty"`
+	// Placement metadata copied from the provider profile credential
+	// declaration. Populated only for proxy-delivered credentials so the
+	// sandbox proxy can build the outbound header from this binding alone.
+	AuthStyle     string `protobuf:"bytes,5,opt,name=auth_style,json=authStyle,proto3" json:"auth_style,omitempty"`
+	HeaderName    string `protobuf:"bytes,6,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8750,6 +8755,20 @@ func (x *StaticCredentialBinding) GetDelivery() ProviderCredentialDelivery {
 		return x.Delivery
 	}
 	return ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_UNSPECIFIED
+}
+
+func (x *StaticCredentialBinding) GetAuthStyle() string {
+	if x != nil {
+		return x.AuthStyle
+	}
+	return ""
+}
+
+func (x *StaticCredentialBinding) GetHeaderName() string {
+	if x != nil {
+		return x.HeaderName
+	}
+	return ""
 }
 
 // Get sandbox provider environment response.
@@ -15558,12 +15577,16 @@ const file_openshell_proto_rawDesc = "" +
 	"\x1fStaticCredentialEndpointBinding\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +
-	"\x04path\x18\x03 \x01(\tR\x04path\"\x9b\x02\n" +
+	"\x04path\x18\x03 \x01(\tR\x04path\"\xdb\x02\n" +
 	"\x17StaticCredentialBinding\x12K\n" +
 	"\tendpoints\x18\x01 \x03(\v2-.openshell.v1.StaticCredentialEndpointBindingR\tendpoints\x12/\n" +
 	"\x13credential_identity\x18\x02 \x01(\tR\x12credentialIdentity\x12<\n" +
 	"\x1aworkload_credential_handle\x18\x03 \x01(\tR\x18workloadCredentialHandle\x12D\n" +
-	"\bdelivery\x18\x04 \x01(\x0e2(.openshell.v1.ProviderCredentialDeliveryR\bdelivery\"\x90\b\n" +
+	"\bdelivery\x18\x04 \x01(\x0e2(.openshell.v1.ProviderCredentialDeliveryR\bdelivery\x12\x1d\n" +
+	"\n" +
+	"auth_style\x18\x05 \x01(\tR\tauthStyle\x12\x1f\n" +
+	"\vheader_name\x18\x06 \x01(\tR\n" +
+	"headerName\"\x90\b\n" +
 	"%GetSandboxProviderEnvironmentResponse\x12l\n" +
 	"\venvironment\x18\x01 \x03(\v2D.openshell.v1.GetSandboxProviderEnvironmentResponse.EnvironmentEntryB\x04\x88\xb5\x18\x01R\venvironment\x122\n" +
 	"\x15provider_env_revision\x18\x02 \x01(\x04R\x13providerEnvRevision\x12\x87\x01\n" +

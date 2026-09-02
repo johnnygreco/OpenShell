@@ -239,25 +239,7 @@ pub fn validate_access_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_token68(token: &str) -> bool {
-    let mut padding_started = false;
-    let mut saw_value = false;
-    for byte in token.bytes() {
-        if byte == b'=' {
-            padding_started = true;
-            continue;
-        }
-        if padding_started || !is_token68_value_byte(byte) {
-            return false;
-        }
-        saw_value = true;
-    }
-    saw_value
-}
-
-fn is_token68_value_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-}
+pub use crate::provider_credentials::is_token68;
 
 fn failure_message(status: reqwest::StatusCode, body: &str) -> String {
     let Ok(error_response) = serde_json::from_str::<OAuthErrorResponse>(body) else {

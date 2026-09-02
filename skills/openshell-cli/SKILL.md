@@ -147,6 +147,12 @@ endpoint-bound placeholder to the sandbox. A custom profile may instead use
 keeps both the credential and its placeholder out of the workload environment;
 the inspected HTTP proxy sets the complete header only after the request passes
 network and middleware policy. Export the profile to confirm which mode applies.
+A `502` with error code `provider_authentication_failed` means a bound request
+reached the proxy but the credential could not be injected; check the sandbox
+OCSF log for the `Proxy-delivered credential` event. An upstream `401` on a
+proxy-delivered endpoint usually means the request bypassed inspection, for
+example through a `tls: skip` policy endpoint or a path outside the profile
+endpoints, so no header was replaced.
 
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port

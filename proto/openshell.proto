@@ -2078,6 +2078,11 @@ message StaticCredentialBinding {
   string workload_credential_handle = 3;
   // Delivery mode copied from the provider profile credential declaration.
   ProviderCredentialDelivery delivery = 4;
+  // Placement metadata copied from the provider profile credential
+  // declaration. Populated only for proxy-delivered credentials so the
+  // sandbox proxy can build the outbound header from this binding alone.
+  string auth_style = 5;
+  string header_name = 6;
 }
 
 // Get sandbox provider environment response.

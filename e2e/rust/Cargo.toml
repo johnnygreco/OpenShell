@@ -119,6 +119,11 @@ path = "tests/provider_token_exchange.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "provider_proxy_delivery"
+path = "tests/provider_proxy_delivery.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
 name = "readyz_health"
 path = "tests/readyz_health.rs"
 required-features = ["e2e-kubernetes"]
