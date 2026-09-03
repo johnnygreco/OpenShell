@@ -394,6 +394,23 @@ subject, and gateway SPIFFE subject, and their cache lifetime is capped by the
 intermediate token response, stored subject-token expiry, and supervisor SVID
 expiry.
 
+Static credentials may instead opt into proxy delivery (`delivery: proxy` on a
+`bearer` or named `header` profile credential). The gateway marks the static
+credential binding with the delivery mode and placement metadata, and the
+supervisor removes the key from the child environment so the workload holds
+neither the secret nor a placeholder. For an inspected REST request whose
+endpoint matches a proxy-delivered binding, the proxy resolves the value through
+the same request-scoped resolver used for placeholders and replaces the complete
+header immediately before the upstream write, after network policy, L7 rules,
+and middleware have admitted the request. The binding is the only source of
+truth: the proxy does not consult profile metadata at request time. Aliases of
+one credential collapse into a single header; distinct matching credentials fail
+closed because the gateway already rejects that configuration. Injection
+requires an inspected REST endpoint without `tls: skip`, so uninspected traffic
+forwards whatever header the application sent. Success and failure both emit an
+OCSF HTTP activity event naming the environment key and endpoint but never the
+value.
+
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
 strips the client's placeholder-based AWS auth headers, re-signs with real
