@@ -85,6 +85,7 @@ pub async fn run_process(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     agent_proposals: AgentProposals,
+    admission_tokens: Option<crate::admission_token::AdmissionTokenRegistry>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
@@ -291,6 +292,7 @@ pub async fn run_process(
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
         let main_session_clone = Arc::clone(&main_session);
+        let admission_tokens_clone = admission_tokens.clone();
         let user_env_clone: std::collections::HashMap<String, String> =
             std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
                 .ok()
@@ -315,6 +317,7 @@ pub async fn run_process(
                 enforcement_mode,
                 shared_ssh_socket,
                 main_session_clone,
+                admission_tokens_clone,
             )
             .await
             {

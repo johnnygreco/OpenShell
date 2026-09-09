@@ -280,6 +280,7 @@ if [[ -n "${OPENSHELL_SANDBOX_PROXY_CA_BUNDLE+x}" ]]; then
 fi
 
 append_local_otlp_config_if_available "${CONFIG_PATH}"
+bash "${ROOT}/tasks/scripts/append-gateway-config-fragment.sh" "${CONFIG_PATH}"
 
 GATEWAY_ENDPOINT="http://${CLI_ENDPOINT_HOST}:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

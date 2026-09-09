@@ -58,6 +58,25 @@ func TestProfileCategoryToProto(t *testing.T) {
 	}
 }
 
+func TestCredentialDeliveryRoundTrip(t *testing.T) {
+	tests := []struct {
+		proto pb.ProviderCredentialDelivery
+		sdk   v1.CredentialDelivery
+	}{
+		{pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_ENVIRONMENT, v1.CredentialDeliveryEnvironment},
+		{pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_PROXY, v1.CredentialDeliveryProxy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.proto.String(), func(t *testing.T) {
+			assert.Equal(t, tt.sdk, CredentialDeliveryFromProto(tt.proto))
+			assert.Equal(t, tt.proto, CredentialDeliveryToProto(tt.sdk))
+		})
+	}
+
+	assert.Empty(t, CredentialDeliveryFromProto(pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_UNSPECIFIED))
+	assert.Equal(t, pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_UNSPECIFIED, CredentialDeliveryToProto(v1.CredentialDelivery("unknown")))
+}
+
 // --- NetworkEndpoint ---
 
 func TestNetworkEndpointFromProto(t *testing.T) {
@@ -142,6 +161,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 		Description:  "API key for auth",
 		EnvVars:      []string{"ANTHROPIC_API_KEY", "API_KEY"},
 		Required:     true,
+		Delivery:     pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_PROXY,
 		AuthStyle:    "header",
 		HeaderName:   "X-API-Key",
 		QueryParam:   "api_key",
@@ -176,6 +196,7 @@ func TestProfileCredentialFromProto(t *testing.T) {
 	assert.Equal(t, "API key for auth", cred.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY", "API_KEY"}, cred.EnvVars)
 	assert.True(t, cred.Required)
+	assert.Equal(t, v1.CredentialDeliveryProxy, cred.Delivery)
 	assert.True(t, cred.Secret, "credential with refresh config is secret")
 	assert.Equal(t, "header", cred.AuthStyle)
 	assert.Equal(t, "X-API-Key", cred.HeaderName)
@@ -253,6 +274,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 		Description: "API key",
 		EnvVars:     []string{"ANTHROPIC_API_KEY"},
 		Required:    true,
+		Delivery:    v1.CredentialDeliveryProxy,
 		Secret:      true,
 		Refresh: &v1.ProfileCredentialRefresh{
 			Strategy:             v1.RefreshStrategyOAuth2RefreshToken,
@@ -294,6 +316,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, "API key", proto.Description)
 	assert.Equal(t, []string{"ANTHROPIC_API_KEY"}, proto.EnvVars)
 	assert.True(t, proto.Required)
+	assert.Equal(t, pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_PROXY, proto.Delivery)
 	assert.Equal(t, "header", proto.AuthStyle)
 	assert.Equal(t, "X-API-Key", proto.HeaderName)
 	assert.Equal(t, "api_key", proto.QueryParam)

@@ -79,6 +79,30 @@ func CredentialTokenGrantTypeToProto(t types.CredentialTokenGrantType) pb.Provid
 	}
 }
 
+// CredentialDeliveryFromProto converts a proto credential delivery mode to an SDK credential delivery mode.
+func CredentialDeliveryFromProto(d pb.ProviderCredentialDelivery) types.CredentialDelivery {
+	switch d {
+	case pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_ENVIRONMENT:
+		return types.CredentialDeliveryEnvironment
+	case pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_PROXY:
+		return types.CredentialDeliveryProxy
+	default:
+		return types.CredentialDelivery("")
+	}
+}
+
+// CredentialDeliveryToProto converts an SDK credential delivery mode to a proto credential delivery mode.
+func CredentialDeliveryToProto(d types.CredentialDelivery) pb.ProviderCredentialDelivery {
+	switch d {
+	case types.CredentialDeliveryEnvironment:
+		return pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_ENVIRONMENT
+	case types.CredentialDeliveryProxy:
+		return pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_PROXY
+	default:
+		return pb.ProviderCredentialDelivery_PROVIDER_CREDENTIAL_DELIVERY_UNSPECIFIED
+	}
+}
+
 // --- NetworkEndpoint ---
 
 // NetworkEndpointFromProto converts a proto NetworkEndpoint to an SDK NetworkEndpoint.
@@ -141,6 +165,7 @@ func ProfileCredentialFromProto(c *pb.ProviderProfileCredential) *types.ProfileC
 		Description:  c.GetDescription(),
 		EnvVars:      CopyStringSlice(c.GetEnvVars()),
 		Required:     c.GetRequired(),
+		Delivery:     CredentialDeliveryFromProto(c.GetDelivery()),
 		Secret:       c.GetRefresh() != nil,
 		Refresh:      profileCredentialRefreshFromProto(c.GetRefresh()),
 		AuthStyle:    c.GetAuthStyle(),
@@ -161,6 +186,7 @@ func ProfileCredentialToProto(c *types.ProfileCredential) *pb.ProviderProfileCre
 		Description:  c.Description,
 		EnvVars:      CopyStringSlice(c.EnvVars),
 		Required:     c.Required,
+		Delivery:     CredentialDeliveryToProto(c.Delivery),
 		AuthStyle:    c.AuthStyle,
 		HeaderName:   c.HeaderName,
 		QueryParam:   c.QueryParam,

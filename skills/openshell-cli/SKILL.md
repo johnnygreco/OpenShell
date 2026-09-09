@@ -141,6 +141,19 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+Static credentials use `delivery: environment` by default, which exposes an
+endpoint-bound placeholder to the sandbox. A custom profile may instead use
+`delivery: proxy` with `auth_style: bearer` or a named header. Proxy delivery
+keeps both the credential and its placeholder out of the workload environment;
+the inspected HTTP proxy sets the complete header only after the request passes
+network and middleware policy. Export the profile to confirm which mode applies.
+A `502` with error code `provider_authentication_failed` means a bound request
+reached the proxy but the credential could not be injected; check the sandbox
+OCSF log for the `Proxy-delivered credential` event. An upstream `401` on a
+proxy-delivered endpoint usually means the request bypassed inspection, for
+example through a `tls: skip` policy endpoint or a path outside the profile
+endpoints, so no header was replaced.
+
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
 must match. For a tunnel to `api.example.com:8443`, send
@@ -498,11 +511,19 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
-- Ordered `network_middlewares`, host selection, HTTP and WebSocket bindings, and `fail_open` or `fail_closed` behavior
+- Ordered `network_middlewares`, host selection, HTTP, WebSocket, and agent-conversation bindings, and `fail_open` or `fail_closed` behavior
 
 `network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect parsed HTTP request bodies and complete client-to-upstream WebSocket text messages over both `ws://` and `wss://` when the implementation advertises the matching binding. The built-in `openshell/regex` advertises both bindings and applies its fixed patterns to UTF-8 text. A host-matched HTTP-only attachment can inspect the upgrade GET but does not join the WebSocket chain; look for `binding_not_selected` coverage. Binary messages pass under both `on_error` modes and active stages emit `unsupported_message_type` coverage; upstream-to-client messages remain uninspected. A broken fail-open WebSocket stage is disabled for the rest of that connection; inspect sandbox OCSF logs for `openshell.middleware.websocket_stage_disabled`.
+
+An operator service can also advertise `AGENT_CONVERSATION/AGENT_CONTEXT`.
+Agent admission requires `fail_closed`, exactly one configured agent binding,
+and one exact provider host that resolves to one admitted network endpoint. The
+supervisor exposes `OPENSHELL_AGENT_CONVERSATION_URL` in combined topology and
+uses that generic variable for every harness. Adding the first agent binding to
+a running sandbox requires recreating the sandbox so OpenShell installs the
+bridge listener and environment.
 
 ### Step 5: Push the updated policy
 
