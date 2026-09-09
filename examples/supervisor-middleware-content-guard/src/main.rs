@@ -11,13 +11,12 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
     SupervisorMiddleware, SupervisorMiddlewareServer,
 };
 use openshell_core::proto::{
-    AgentConversationEvaluation, AgentConversationResult, Decision, Finding,
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding, MiddlewareManifest,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, ValidateConfigRequest,
-    ValidateConfigResponse, WebSocketMessage, WebSocketMessageResult, WebSocketPreflightAction,
-    WebSocketPreflightDecision, WebSocketSessionEvent, WebSocketSessionEventResult,
-    web_socket_message, web_socket_message_result, web_socket_session_event,
-    web_socket_session_event_result,
+    AgentConversationEvaluation, AgentConversationResult, Decision, Finding, HttpRequestEvaluation,
+    HttpRequestResult, MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
+    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse, WebSocketMessage,
+    WebSocketMessageResult, WebSocketPreflightAction, WebSocketPreflightDecision,
+    WebSocketSessionEvent, WebSocketSessionEventResult, web_socket_message,
+    web_socket_message_result, web_socket_session_event, web_socket_session_event_result,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -490,7 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{WebSocketPreflight, WebSocketSessionEnd, WebSocketSessionStart};
+    use openshell_core::proto::{MiddlewareSessionEnd, WebSocketPreflight, WebSocketSessionStart};
     use prost_types::{ListValue, Value};
     use std::collections::BTreeMap;
 
@@ -562,7 +561,7 @@ mod tests {
                 )),
             })),
             event(web_socket_session_event::Event::SessionEnd(
-                WebSocketSessionEnd::default(),
+                MiddlewareSessionEnd::default(),
             )),
         ]);
         let mut results = ContentGuard::websocket_stream(events);

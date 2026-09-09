@@ -5832,7 +5832,7 @@ async fn handle_forward_proxy(
             );
             if let Some(session) = middleware_session.take() {
                 session
-                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
             respond(
@@ -5890,7 +5890,7 @@ async fn handle_forward_proxy(
             );
             if let Some(session) = middleware_session.take() {
                 session
-                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
             respond(
@@ -5926,7 +5926,7 @@ async fn handle_forward_proxy(
             );
             if let Some(session) = middleware_session.take() {
                 session
-                    .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
             if e.is_endpoint_mismatch() {
@@ -5969,7 +5969,7 @@ async fn handle_forward_proxy(
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
         respond(
@@ -6014,7 +6014,7 @@ async fn handle_forward_proxy(
             ocsf_emit!(event);
             if let Some(session) = middleware_session.take() {
                 session
-                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                     .await;
             }
             respond(
@@ -6043,7 +6043,7 @@ async fn handle_forward_proxy(
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         if let Some(session) = middleware_session.take() {
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
         respond(
@@ -6096,7 +6096,7 @@ async fn handle_forward_proxy(
             if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
                 if let Some(session) = middleware_session.take() {
                     session
-                        .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                         .await;
                 }
                 crate::l7::relay::reject_credential_resolution(client, &l7_ctx, error).await?;
@@ -6138,7 +6138,7 @@ async fn handle_forward_proxy(
         | crate::l7::provider::RelayOutcome::Consumed => {
             if let Some(session) = middleware_session.take() {
                 session
-                    .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                    .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                     .await;
             }
         }
@@ -7375,6 +7375,7 @@ network_policies:
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -8617,6 +8618,7 @@ network_policies:
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -8637,6 +8639,7 @@ network_policies:
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

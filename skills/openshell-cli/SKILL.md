@@ -765,7 +765,7 @@ openshell gateway add https://gateway.example.com --name production
 openshell gateway remove local
 ```
 
-`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
+`https://` registrations default to edge authentication. Use `gateway login` and `gateway logout` to refresh or clear stored authentication. For an OIDC gateway, supply `--oidc-issuer` and, when needed, `--oidc-client-id`, `--oidc-audience`, and `--oidc-scopes`. If automatic OIDC refresh fails, protected commands stop before sending an RPC and direct the user to run `openshell gateway login <name>`; `openshell status` still reports gateway reachability and authentication separately. For remote mTLS gateways, use `--remote USER@HOST` or an `ssh://` endpoint.
 
 For one-off automation, `--gateway-endpoint URL` connects directly without stored metadata. Limit `--gateway-insecure` to explicitly trusted development endpoints.
 
@@ -791,6 +791,9 @@ openshell settings delete work-session --key ocsf_json_enabled
 
 openshell settings get --global --json
 openshell settings set --global --key ocsf_json_enabled --value true
+
+# OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
+openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.

@@ -44,12 +44,13 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
-    watch_sandboxes_event,
+    CpuResourceCapabilities, DriverCondition as SandboxCondition,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxSpec as SandboxSpec, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesResponse, GpuResourceCapabilities,
+    GpuResourceRequirements, MemoryResourceCapabilities, ResourceCapabilities,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
@@ -576,6 +577,20 @@ impl KubernetesComputeDriver {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
+            resource_capabilities: Some(ResourceCapabilities {
+                cpu: Some(CpuResourceCapabilities {
+                    limit_supported: true,
+                }),
+                memory: Some(MemoryResourceCapabilities {
+                    limit_supported: true,
+                }),
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: true,
+                    count_selection_supported: true,
+                }),
+            }),
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         })
     }
 
@@ -1428,10 +1443,10 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     #[tracing::instrument(
-        name = "kubernetes.create_sandbox",
+        name = "kubernetes.provision",
         skip(self, sandbox),
         fields(
-            otel.name = "kubernetes.create_sandbox",
+            otel.name = "kubernetes.provision",
             otel.status_code = tracing::field::Empty,
             sandbox.id = %sandbox.id,
             sandbox.name = %sandbox.name,
@@ -4945,12 +4960,13 @@ mod tests {
         use tracing::instrument::WithSubscriber as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
         let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
 
         driver
@@ -4963,7 +4979,7 @@ mod tests {
         let spans = exporter.get_finished_spans().unwrap();
         let span = spans
             .iter()
-            .find(|span| span.name == "kubernetes.create_sandbox")
+            .find(|span| span.name == "kubernetes.provision")
             .expect("create operation span");
         assert!(matches!(
             span.status,
@@ -4977,15 +4993,16 @@ mod tests {
         use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider};
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let _tracing_lock = crate::otel_tracing::test_lock().await;
+        let _tracing_lock = openshell_otel_test_support::tracing_test_lock().await;
         let exporter = InMemorySpanExporterBuilder::new().build();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter)
             .build();
-        let subscriber = tracing_subscriber::registry().with(crate::otel_tracing::layer(&provider));
+        let subscriber =
+            tracing_subscriber::registry().with(crate::otel_tracing::TRACING.layer(&provider));
 
         let annotations = tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!("kubernetes.create_sandbox");
+            let span = tracing::info_span!("kubernetes.provision");
             let _entered = span.enter();
             let mut annotations = BTreeMap::new();
             add_trace_context_annotation(&mut annotations);
@@ -8715,5 +8732,20 @@ mod tests {
             namespace_watcher_retry_delay(3, 1),
             namespace_watcher_retry_delay(3, 2)
         );
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_static_resource_support() {
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig::default());
+        let resources = driver
+            .capabilities()
+            .unwrap()
+            .resource_capabilities
+            .unwrap();
+        assert!(resources.cpu.unwrap().limit_supported);
+        assert!(resources.memory.unwrap().limit_supported);
+        let gpu = resources.gpu.unwrap();
+        assert!(gpu.default_selection_supported);
+        assert!(gpu.count_selection_supported);
     }
 }
